@@ -38,6 +38,7 @@ Execution Options:
 Output Options:
   -o, --output=FILE     Output file (default: stdout)
   -q, --quiet           Only output trace, no status messages
+  -d, --dump=START:LEN  Dump memory range at exit (hex, can repeat)
 
 Other:
   -h, --help            Show help
@@ -87,6 +88,23 @@ Test interrupt handling (trigger IRQ level 1 after 500 instructions):
 ```bash
 ./tms9900-trace --irq=1@500 program.bin
 ```
+
+Dump memory after execution to verify results:
+```bash
+./tms9900-trace -l 0x8000 -d 0x8100:32 -d 0x8200:16 program.bin
+```
+
+## Memory Dumps
+
+The `-d, --dump=START:LEN` option dumps memory ranges at exit, useful for verifying program results without implementing I/O. Output goes to stderr in hex+ASCII format:
+
+```
+Memory dump 0x8100 - 0x811F (32 bytes):
+  8100: 0037 0056 008D 0000 0001 0002 0005 0008  |.7.V............|
+  8110: 0009 0000 0000 0000 0000 0000 0000 0000  |................|
+```
+
+Multiple dump ranges can be specified by repeating the `-d` option.
 
 ## Interrupt Simulation
 

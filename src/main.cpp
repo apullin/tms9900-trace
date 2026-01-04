@@ -30,6 +30,12 @@ struct ScheduledIRQ
 // Configuration
 //----------------------------------------------------------------------------
 
+struct MemoryDump
+{
+    UINT16 start;
+    UINT16 length;
+};
+
 struct Config
 {
     const char* inputFile = nullptr;
@@ -40,6 +46,7 @@ struct Config
     UINT64 maxSteps = 1000000;
     std::vector<UINT16> stopAddrs;
     std::vector<ScheduledIRQ> irqs;
+    std::vector<MemoryDump> dumps;
     bool quiet = false;
     bool entrySet = false;
 };
@@ -65,6 +72,7 @@ static void PrintUsage(const char* prog)
     fprintf(stderr, "Output Options:\n");
     fprintf(stderr, "  -o, --output=FILE     Output file (default: stdout)\n");
     fprintf(stderr, "  -q, --quiet           Only output trace, no status messages\n");
+    fprintf(stderr, "  -d, --dump=START:LEN  Dump memory range at exit (hex, can repeat)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Other:\n");
     fprintf(stderr, "  -h, --help            Show this help\n");
@@ -132,6 +140,51 @@ static bool ParseIRQ(const char* str, ScheduledIRQ* irq)
 
     irq->level = level;
     irq->atStep = step;
+    return true;
+}
+
+//----------------------------------------------------------------------------
+// Parse memory dump spec: START:LENGTH (e.g., "0x8300:32")
+//----------------------------------------------------------------------------
+
+static bool ParseDump(const char* str, MemoryDump* dump)
+{
+    char* colon = (char*)strchr(str, ':');
+    if (!colon)
+    {
+        return false;
+    }
+
+    // Temporarily terminate at colon to parse start address
+    *colon = '\0';
+    UINT16 start;
+    bool ok = ParseHex(str, &start);
+    *colon = ':';
+
+    if (!ok)
+    {
+        return false;
+    }
+
+    // Parse length (decimal or hex)
+    char* end;
+    unsigned long length;
+    if (colon[1] == '0' && (colon[2] == 'x' || colon[2] == 'X'))
+    {
+        length = strtoul(colon + 1, &end, 16);
+    }
+    else
+    {
+        length = strtoul(colon + 1, &end, 10);
+    }
+
+    if (*end != '\0' || length == 0 || length > 0x10000)
+    {
+        return false;
+    }
+
+    dump->start = start;
+    dump->length = (UINT16)length;
     return true;
 }
 
@@ -242,13 +295,14 @@ int main(int argc, char* argv[])
         {"stop-at",   required_argument, nullptr, 's'},
         {"irq",       required_argument, nullptr, 'i'},
         {"output",    required_argument, nullptr, 'o'},
+        {"dump",      required_argument, nullptr, 'd'},
         {"quiet",     no_argument,       nullptr, 'q'},
         {"help",      no_argument,       nullptr, 'h'},
         {nullptr,     0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "l:e:w:n:s:o:qh", longOpts, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "l:e:w:n:s:o:d:qh", longOpts, nullptr)) != -1)
     {
         switch (opt)
         {
@@ -308,6 +362,17 @@ int main(int argc, char* argv[])
             case 'o':
                 cfg.outputFile = optarg;
                 break;
+            case 'd':
+            {
+                MemoryDump dump;
+                if (!ParseDump(optarg, &dump))
+                {
+                    fprintf(stderr, "Error: Invalid dump spec '%s' (use START:LENGTH, e.g., 0x8300:32)\n", optarg);
+                    return 1;
+                }
+                cfg.dumps.push_back(dump);
+                break;
+            }
             case 'q':
                 cfg.quiet = true;
                 break;
@@ -484,6 +549,35 @@ int main(int argc, char* argv[])
         else if (step >= cfg.maxSteps)
         {
             fprintf(stderr, "  Status:       MAX STEPS REACHED\n");
+        }
+    }
+
+    // Memory dumps
+    for (const auto& dump : cfg.dumps)
+    {
+        fprintf(stderr, "\nMemory dump 0x%04X - 0x%04X (%u bytes):\n",
+                dump.start, dump.start + dump.length - 1, dump.length);
+
+        for (UINT16 offset = 0; offset < dump.length; offset += 16)
+        {
+            fprintf(stderr, "  %04X:", dump.start + offset);
+
+            // Hex words
+            for (UINT16 i = 0; i < 16 && offset + i < dump.length; i += 2)
+            {
+                UINT16 addr = dump.start + offset + i;
+                UINT16 word = ReadWord(addr);
+                fprintf(stderr, " %04X", word);
+            }
+
+            // ASCII representation
+            fprintf(stderr, "  |");
+            for (UINT16 i = 0; i < 16 && offset + i < dump.length; i++)
+            {
+                UINT8 byte = Memory[dump.start + offset + i];
+                fprintf(stderr, "%c", (byte >= 32 && byte < 127) ? byte : '.');
+            }
+            fprintf(stderr, "|\n");
         }
     }
 
