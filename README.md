@@ -38,6 +38,7 @@ Execution Options:
 Output Options:
   -o, --output=FILE     Output file (default: stdout)
   -q, --quiet           Only output trace, no status messages
+  -S, --summary         Output only final state as JSON (no per-step trace)
   -d, --dump=START:LEN  Dump memory range at exit (hex, can repeat)
 
 Other:
@@ -49,15 +50,15 @@ Other:
 Each line is a JSON object with all values in hex:
 
 ```json
-{"step":0,"pc":"6000","wp":"8300","st":"0000","clk":0,"op":"LWPI","asm":"LWPI >8300","r":["0000","0000","0000","0000","0000","0000","0000","0000","0000","0000","0000","0000","0000","0000","0000","0000"]}
+{"step":0,"pc":"6000","wp":"8300","st":"0000","clk":0,"op":"LWPI","asm":"LWPI >8300","r":["0000",...]}
 ```
 
 Fields:
-- `step`: Instruction number (0-indexed, decimal)
+- `step`: Instruction number (0-indexed)
 - `pc`: Program counter before execution (hex)
 - `wp`: Workspace pointer before execution (hex)
 - `st`: Status register before execution (hex)
-- `clk`: Clock cycle counter before execution (decimal)
+- `clk`: Clock cycles (rough estimate, see below)
 - `op`: Instruction mnemonic
 - `asm`: Full disassembly
 - `r`: Array of R0-R15 values (hex strings)
@@ -93,6 +94,26 @@ Dump memory after execution to verify results:
 ```bash
 ./tms9900-trace -l 0x8000 -d 0x8100:32 -d 0x8200:16 program.bin
 ```
+
+Run silently, output only final state (for test harnesses):
+```bash
+./tms9900-trace -S test.bin
+```
+
+## Summary Mode (Test Harness)
+
+The `-S, --summary` option runs silently and outputs a single JSON line with final CPU state:
+
+```json
+{"pc":"0010","wp":"8300","st":"C000","clk":76,"steps":5,"halt":"idle","r":["1235","0001",...]}
+```
+
+Fields:
+- `pc`, `wp`, `st`: Final CPU registers (hex)
+- `clk`: Clock cycles (rough estimate)
+- `steps`: Instructions executed
+- `halt`: Stop reason (`"idle"`, `"stop"`, `"loop"`, `"max"`)
+- `r`: R0-R15 values (hex)
 
 ## Memory Dumps
 
@@ -137,11 +158,11 @@ The simulator stops when:
 3. IDLE instruction executed (unless an interrupt wakes it)
 4. Infinite loop detected (PC unchanged after instruction)
 
-## Cycle Timing
+## Cycle Timing (Rough Estimate)
 
-Cycle counts are based on the TMS9900 Data Manual (May 1976), Table 3. The `clk` field in the trace output shows cumulative clock cycles.
+The `clk` field provides a rough cycle count based on base instruction timings from the TMS9900 Data Manual. This does NOT account for addressing mode overhead or memory wait states - actual hardware timing would be higher.
 
-Key timings (base cycles, register-to-register):
+Base timings (register-to-register only):
 - Arithmetic (A, S, etc): 14 cycles
 - Load Immediate (LI): 12 cycles
 - Branch (B): 8 cycles
@@ -152,11 +173,6 @@ Key timings (base cycles, register-to-register):
 - Shift: 12 + 2*count cycles
 - Multiply: 52 cycles
 - Divide: 16 (overflow) or 92-124 cycles
-
-Address mode overhead (word operations):
-- Register indirect: +4 cycles
-- Auto-increment: +8 cycles
-- Symbolic/Indexed: +8 cycles
 
 ## Limitations
 

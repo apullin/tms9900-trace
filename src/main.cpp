@@ -48,6 +48,7 @@ struct Config
     std::vector<ScheduledIRQ> irqs;
     std::vector<MemoryDump> dumps;
     bool quiet = false;
+    bool summary = false;
     bool entrySet = false;
 };
 
@@ -72,6 +73,7 @@ static void PrintUsage(const char* prog)
     fprintf(stderr, "Output Options:\n");
     fprintf(stderr, "  -o, --output=FILE     Output file (default: stdout)\n");
     fprintf(stderr, "  -q, --quiet           Only output trace, no status messages\n");
+    fprintf(stderr, "  -S, --summary         Output only final state as JSON (no per-step trace)\n");
     fprintf(stderr, "  -d, --dump=START:LEN  Dump memory range at exit (hex, can repeat)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Other:\n");
@@ -259,10 +261,11 @@ static void OutputTrace(FILE* out, const TraceState& t)
             (unsigned long long)t.step, t.pc, t.wp, t.st, t.clocks);
     fprintf(out, "\"op\":\"%s\",\"asm\":\"%s\",\"r\":[", t.mnemonic, t.disasm);
 
-    // Output registers as hex strings
+    // Output registers as hex strings (read directly, don't affect clock)
     for (int i = 0; i < 16; i++)
     {
-        UINT16 reg = ReadWord(t.wp + i * 2);
+        UINT16 addr = (t.wp + i * 2) & 0xFFFE;
+        UINT16 reg = (Memory[addr] << 8) | Memory[addr + 1];
         if (i > 0) fprintf(out, ",");
         fprintf(out, "\"%04X\"", reg);
     }
@@ -297,12 +300,13 @@ int main(int argc, char* argv[])
         {"output",    required_argument, nullptr, 'o'},
         {"dump",      required_argument, nullptr, 'd'},
         {"quiet",     no_argument,       nullptr, 'q'},
+        {"summary",   no_argument,       nullptr, 'S'},
         {"help",      no_argument,       nullptr, 'h'},
         {nullptr,     0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "l:e:w:n:s:o:d:qh", longOpts, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "l:e:w:n:s:o:d:qSh", longOpts, nullptr)) != -1)
     {
         switch (opt)
         {
@@ -376,6 +380,9 @@ int main(int argc, char* argv[])
             case 'q':
                 cfg.quiet = true;
                 break;
+            case 'S':
+                cfg.summary = true;
+                break;
             case 'h':
                 PrintUsage(argv[0]);
                 return 0;
@@ -433,7 +440,7 @@ int main(int argc, char* argv[])
     ClockCycleCounter = 0;
     InstructionCounter = 0;
 
-    if (!cfg.quiet)
+    if (!cfg.quiet && !cfg.summary)
     {
         fprintf(stderr, "TMS9900 Trace\n");
         fprintf(stderr, "  Input:  %s\n", cfg.inputFile);
@@ -468,6 +475,7 @@ int main(int argc, char* argv[])
     bool halted = false;
     UINT16 lastPC = 0xFFFF;
     size_t nextIRQ = 0;
+    const char* haltReason = "max";
 
     while (step < cfg.maxSteps && !halted)
     {
@@ -475,7 +483,7 @@ int main(int argc, char* argv[])
         while (nextIRQ < cfg.irqs.size() && cfg.irqs[nextIRQ].atStep <= step)
         {
             TriggerInterrupt(cfg.irqs[nextIRQ].level);
-            if (!cfg.quiet)
+            if (!cfg.quiet && !cfg.summary)
             {
                 fprintf(stderr, "[Step %llu] Triggered IRQ level %d\n",
                         (unsigned long long)step, cfg.irqs[nextIRQ].level);
@@ -492,20 +500,22 @@ int main(int argc, char* argv[])
         // Check stop address
         if (!cfg.stopAddrs.empty() && IsStopAddress(pc, cfg.stopAddrs))
         {
-            if (!cfg.quiet)
+            if (!cfg.quiet && !cfg.summary)
             {
                 fprintf(stderr, "Stopped at address 0x%04X\n", pc);
             }
+            haltReason = "stop";
             break;
         }
 
         // Check for infinite loop (JMP $)
         if (pc == lastPC)
         {
-            if (!cfg.quiet)
+            if (!cfg.quiet && !cfg.summary)
             {
                 fprintf(stderr, "Infinite loop detected at 0x%04X\n", pc);
             }
+            haltReason = "loop";
             break;
         }
         lastPC = pc;
@@ -515,31 +525,37 @@ int main(int argc, char* argv[])
 
         // Execute
         halted = StepCPU();
-
-        // Get opcode info
-        sOpCode* op = GetLastOpcode();
-        const char* mnemonic = op ? op->mnemonic : "???";
-
-        // Skip the "XXXX " prefix from disassembly for cleaner output
-        const char* disasm = disasmBuf;
-        if (strlen(disasmBuf) > 5)
+        if (halted)
         {
-            disasm = disasmBuf + 5;  // Skip "XXXX "
+            haltReason = "idle";
         }
 
-        // Output trace
-        TraceState trace = { step, pc, wp, st, clocks, mnemonic, disasm };
-        OutputTrace(out, trace);
+        // Output trace (skip in summary mode)
+        if (!cfg.summary)
+        {
+            sOpCode* op = GetLastOpcode();
+            const char* mnemonic = op ? op->mnemonic : "???";
+
+            // Skip the "XXXX " prefix from disassembly for cleaner output
+            const char* disasm = disasmBuf;
+            if (strlen(disasmBuf) > 5)
+            {
+                disasm = disasmBuf + 5;  // Skip "XXXX "
+            }
+
+            TraceState trace = { step, pc, wp, st, clocks, mnemonic, disasm };
+            OutputTrace(out, trace);
+        }
 
         step++;
     }
 
-    // Final stats
-    if (!cfg.quiet)
+    // Final stats (human-readable)
+    if (!cfg.quiet && !cfg.summary)
     {
         fprintf(stderr, "\nExecution complete:\n");
         fprintf(stderr, "  Instructions: %llu\n", (unsigned long long)step);
-        fprintf(stderr, "  Clock cycles: %u\n", ClockCycleCounter);
+        fprintf(stderr, "  Clocks:       %u (rough estimate)\n", ClockCycleCounter);
         fprintf(stderr, "  Final PC:     0x%04X\n", ProgramCounter);
         fprintf(stderr, "  Final ST:     0x%04X\n", Status);
         if (halted)
@@ -550,6 +566,22 @@ int main(int argc, char* argv[])
         {
             fprintf(stderr, "  Status:       MAX STEPS REACHED\n");
         }
+    }
+
+    // Summary JSON output
+    if (cfg.summary)
+    {
+        fprintf(out, "{\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%u,\"steps\":%llu,\"halt\":\"%s\",\"r\":[",
+                ProgramCounter, WorkspacePtr, Status, ClockCycleCounter,
+                (unsigned long long)step, haltReason);
+        for (int i = 0; i < 16; i++)
+        {
+            UINT16 addr = (WorkspacePtr + i * 2) & 0xFFFE;
+            UINT16 reg = (Memory[addr] << 8) | Memory[addr + 1];
+            if (i > 0) fprintf(out, ",");
+            fprintf(out, "\"%04X\"", reg);
+        }
+        fprintf(out, "]}\n");
     }
 
     // Memory dumps
