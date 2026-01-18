@@ -1,0 +1,4 @@
+# Test tracepoints file
+0x0000
+0x0004
+8   

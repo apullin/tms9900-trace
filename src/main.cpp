@@ -9,6 +9,7 @@
 
 #include "cpu.hpp"
 #include "disasm.hpp"
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,12 @@ struct MemoryDump
     UINT16 length;
 };
 
+struct Tracepoint
+{
+    UINT16 pc;
+    UINT32 hits = 0;
+};
+
 struct Config
 {
     const char* inputFile = nullptr;
@@ -47,6 +54,9 @@ struct Config
     std::vector<UINT16> stopAddrs;
     std::vector<ScheduledIRQ> irqs;
     std::vector<MemoryDump> dumps;
+    std::vector<Tracepoint> tracepoints;
+    UINT64 tracepointMax = 0;
+    bool tracepointStop = false;
     bool quiet = false;
     bool summary = false;
     bool entrySet = false;
@@ -75,6 +85,12 @@ static void PrintUsage(const char* prog)
     fprintf(stderr, "  -q, --quiet           Only output trace, no status messages\n");
     fprintf(stderr, "  -S, --summary         Output only final state as JSON (no per-step trace)\n");
     fprintf(stderr, "  -d, --dump=START:LEN  Dump memory range at exit (hex, can repeat)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Tracepoint Options (require -S):\n");
+    fprintf(stderr, "  -t, --tracepoint=ADDR     Trace only this address (hex, can repeat)\n");
+    fprintf(stderr, "  -T, --tracepoint-file=FILE  Load tracepoint addresses from file\n");
+    fprintf(stderr, "  --tracepoint-max=N        Stop after N total tracepoint hits\n");
+    fprintf(stderr, "  --tracepoint-stop         Stop when all tracepoints hit at least once\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Other:\n");
     fprintf(stderr, "  -h, --help            Show this help\n");
@@ -142,6 +158,64 @@ static bool ParseIRQ(const char* str, ScheduledIRQ* irq)
 
     irq->level = level;
     irq->atStep = step;
+    return true;
+}
+
+//----------------------------------------------------------------------------
+// Add tracepoint (with deduplication)
+//----------------------------------------------------------------------------
+
+static void AddTracepoint(std::vector<Tracepoint>& tracepoints, UINT16 addr)
+{
+    for (const auto& tp : tracepoints)
+    {
+        if (tp.pc == addr) return;  // Already exists
+    }
+    Tracepoint tp;
+    tp.pc = addr;
+    tracepoints.push_back(tp);
+}
+
+//----------------------------------------------------------------------------
+// Parse tracepoint file (one hex address per line, # comments, blank lines ok)
+//----------------------------------------------------------------------------
+
+static bool ParseTracepointFile(const char* path, std::vector<Tracepoint>& tracepoints)
+{
+    FILE* f = fopen(path, "r");
+    if (!f) return false;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+    {
+        // Skip leading whitespace
+        char* p = line;
+        while (*p && isspace(*p)) p++;
+
+        // Skip comments and blank lines
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+
+        // Parse hex address (with or without 0x prefix)
+        char* end;
+        unsigned long val;
+        if (strncmp(p, "0x", 2) == 0 || strncmp(p, "0X", 2) == 0)
+        {
+            val = strtoul(p + 2, &end, 16);
+        }
+        else
+        {
+            val = strtoul(p, &end, 16);
+        }
+
+        if (val > 0xFFFF)
+        {
+            fclose(f);
+            return false;
+        }
+
+        AddTracepoint(tracepoints, (UINT16)val);
+    }
+    fclose(f);
     return true;
 }
 
@@ -257,8 +331,8 @@ struct TraceState
 
 static void OutputTrace(FILE* out, const TraceState& t)
 {
-    fprintf(out, "{\"step\":%llu,\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%u,",
-            (unsigned long long)t.step, t.pc, t.wp, t.st, t.clocks);
+    fprintf(out, "{\"step\":%" PRIu64 ",\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%" PRIu32 ",",
+            t.step, t.pc, t.wp, t.st, t.clocks);
     fprintf(out, "\"op\":\"%s\",\"asm\":\"%s\",\"r\":[", t.mnemonic, t.disasm);
 
     // Output registers as hex strings (read directly, don't affect clock)
@@ -291,22 +365,26 @@ int main(int argc, char* argv[])
     Config cfg;
 
     static struct option longOpts[] = {
-        {"load",      required_argument, nullptr, 'l'},
-        {"entry",     required_argument, nullptr, 'e'},
-        {"wp",        required_argument, nullptr, 'w'},
-        {"max-steps", required_argument, nullptr, 'n'},
-        {"stop-at",   required_argument, nullptr, 's'},
-        {"irq",       required_argument, nullptr, 'i'},
-        {"output",    required_argument, nullptr, 'o'},
-        {"dump",      required_argument, nullptr, 'd'},
-        {"quiet",     no_argument,       nullptr, 'q'},
-        {"summary",   no_argument,       nullptr, 'S'},
-        {"help",      no_argument,       nullptr, 'h'},
-        {nullptr,     0,                 nullptr, 0}
+        {"load",           required_argument, nullptr, 'l'},
+        {"entry",          required_argument, nullptr, 'e'},
+        {"wp",             required_argument, nullptr, 'w'},
+        {"max-steps",      required_argument, nullptr, 'n'},
+        {"stop-at",        required_argument, nullptr, 's'},
+        {"irq",            required_argument, nullptr, 'i'},
+        {"output",         required_argument, nullptr, 'o'},
+        {"dump",           required_argument, nullptr, 'd'},
+        {"tracepoint",     required_argument, nullptr, 't'},
+        {"tracepoint-file", required_argument, nullptr, 'T'},
+        {"tracepoint-max", required_argument, nullptr, 'M'},
+        {"tracepoint-stop", no_argument,      nullptr, 'P'},
+        {"quiet",          no_argument,       nullptr, 'q'},
+        {"summary",        no_argument,       nullptr, 'S'},
+        {"help",           no_argument,       nullptr, 'h'},
+        {nullptr,          0,                 nullptr, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "l:e:w:n:s:o:d:qSh", longOpts, nullptr)) != -1)
+    while ((opt = getopt_long(argc, argv, "l:e:w:n:s:o:d:t:T:M:PqSh", longOpts, nullptr)) != -1)
     {
         switch (opt)
         {
@@ -377,6 +455,32 @@ int main(int argc, char* argv[])
                 cfg.dumps.push_back(dump);
                 break;
             }
+            case 't':
+            {
+                UINT16 addr;
+                if (!ParseHex(optarg, &addr))
+                {
+                    fprintf(stderr, "Error: Invalid tracepoint address '%s'\n", optarg);
+                    return 1;
+                }
+                AddTracepoint(cfg.tracepoints, addr);
+                break;
+            }
+            case 'T':
+            {
+                if (!ParseTracepointFile(optarg, cfg.tracepoints))
+                {
+                    fprintf(stderr, "Error: Failed to read tracepoint file '%s'\n", optarg);
+                    return 1;
+                }
+                break;
+            }
+            case 'M':
+                cfg.tracepointMax = strtoull(optarg, nullptr, 10);
+                break;
+            case 'P':
+                cfg.tracepointStop = true;
+                break;
             case 'q':
                 cfg.quiet = true;
                 break;
@@ -405,6 +509,14 @@ int main(int argc, char* argv[])
     if (!cfg.entrySet)
     {
         cfg.entryAddr = cfg.loadAddr;
+    }
+
+    // Tracepoints require summary mode (otherwise all instructions are traced anyway)
+    if (!cfg.tracepoints.empty() && !cfg.summary)
+    {
+        fprintf(stderr, "Error: --tracepoint requires --summary (-S) mode\n");
+        fprintf(stderr, "       (without -S, all instructions are traced anyway)\n");
+        return 1;
     }
 
     // Sort IRQs by step
@@ -447,7 +559,7 @@ int main(int argc, char* argv[])
         fprintf(stderr, "  Load:   0x%04X\n", cfg.loadAddr);
         fprintf(stderr, "  Entry:  0x%04X\n", cfg.entryAddr);
         fprintf(stderr, "  WP:     0x%04X\n", cfg.wpAddr);
-        fprintf(stderr, "  Max:    %llu steps\n", (unsigned long long)cfg.maxSteps);
+        fprintf(stderr, "  Max:    %" PRIu64 " steps\n", cfg.maxSteps);
         if (!cfg.stopAddrs.empty())
         {
             fprintf(stderr, "  Stop:");
@@ -462,9 +574,26 @@ int main(int argc, char* argv[])
             fprintf(stderr, "  IRQs:");
             for (const auto& irq : cfg.irqs)
             {
-                fprintf(stderr, " %d@%llu", irq.level, (unsigned long long)irq.atStep);
+                fprintf(stderr, " %d@%" PRIu64, irq.level, irq.atStep);
             }
             fprintf(stderr, "\n");
+        }
+        if (!cfg.tracepoints.empty())
+        {
+            fprintf(stderr, "  Tracepoints:");
+            for (const auto& tp : cfg.tracepoints)
+            {
+                fprintf(stderr, " 0x%04X", tp.pc);
+            }
+            fprintf(stderr, "\n");
+            if (cfg.tracepointMax > 0)
+            {
+                fprintf(stderr, "  Tracepoint max: %" PRIu64 "\n", cfg.tracepointMax);
+            }
+            if (cfg.tracepointStop)
+            {
+                fprintf(stderr, "  Tracepoint stop: enabled\n");
+            }
         }
         fprintf(stderr, "\n");
     }
@@ -476,6 +605,7 @@ int main(int argc, char* argv[])
     UINT16 lastPC = 0xFFFF;
     size_t nextIRQ = 0;
     const char* haltReason = "max";
+    UINT64 totalTracepointHits = 0;
 
     while (step < cfg.maxSteps && !halted)
     {
@@ -485,8 +615,8 @@ int main(int argc, char* argv[])
             TriggerInterrupt(cfg.irqs[nextIRQ].level);
             if (!cfg.quiet && !cfg.summary)
             {
-                fprintf(stderr, "[Step %llu] Triggered IRQ level %d\n",
-                        (unsigned long long)step, cfg.irqs[nextIRQ].level);
+                fprintf(stderr, "[Step %" PRIu64 "] Triggered IRQ level %d\n",
+                        step, cfg.irqs[nextIRQ].level);
             }
             nextIRQ++;
         }
@@ -496,6 +626,80 @@ int main(int argc, char* argv[])
         UINT16 wp = WorkspacePtr;
         UINT16 st = Status;
         UINT32 clocks = ClockCycleCounter;
+
+        // Disassemble early (needed for tracepoint output before stop checks)
+        DisassembleASM(pc, &Memory[pc], disasmBuf);
+
+        // Check tracepoints - output trace line immediately if hit
+        for (auto& tp : cfg.tracepoints)
+        {
+            if (pc == tp.pc)
+            {
+                tp.hits++;
+                totalTracepointHits++;
+
+                // Output tracepoint trace immediately (before stop checks)
+                const char* disasm = disasmBuf;
+                if (strlen(disasmBuf) > 5)
+                {
+                    disasm = disasmBuf + 5;  // Skip "XXXX "
+                }
+                // Extract mnemonic from disasm (first word)
+                static char mnemonicBuf[16];
+                const char* space = strchr(disasm, ' ');
+                if (space)
+                {
+                    size_t len = space - disasm;
+                    if (len >= sizeof(mnemonicBuf)) len = sizeof(mnemonicBuf) - 1;
+                    strncpy(mnemonicBuf, disasm, len);
+                    mnemonicBuf[len] = '\0';
+                }
+                else
+                {
+                    strncpy(mnemonicBuf, disasm, sizeof(mnemonicBuf) - 1);
+                    mnemonicBuf[sizeof(mnemonicBuf) - 1] = '\0';
+                }
+
+                TraceState trace = { step, pc, wp, st, clocks, mnemonicBuf, disasm };
+                OutputTrace(out, trace);
+                break;  // Only match one tracepoint per PC
+            }
+        }
+
+        // Check tracepoint-max
+        if (cfg.tracepointMax > 0 && totalTracepointHits >= cfg.tracepointMax)
+        {
+            if (!cfg.quiet)
+            {
+                fprintf(stderr, "Tracepoint max hit (%" PRIu64 " total hits)\n",
+                        totalTracepointHits);
+            }
+            haltReason = "tracepoint-max";
+            break;
+        }
+
+        // Check tracepoint-stop (all tracepoints hit at least once)
+        if (cfg.tracepointStop && !cfg.tracepoints.empty())
+        {
+            bool allHit = true;
+            for (const auto& tp : cfg.tracepoints)
+            {
+                if (tp.hits == 0)
+                {
+                    allHit = false;
+                    break;
+                }
+            }
+            if (allHit)
+            {
+                if (!cfg.quiet)
+                {
+                    fprintf(stderr, "All tracepoints hit at least once\n");
+                }
+                haltReason = "tracepoint-stop";
+                break;
+            }
+        }
 
         // Check stop address
         if (!cfg.stopAddrs.empty() && IsStopAddress(pc, cfg.stopAddrs))
@@ -520,9 +724,6 @@ int main(int argc, char* argv[])
         }
         lastPC = pc;
 
-        // Disassemble
-        DisassembleASM(pc, &Memory[pc], disasmBuf);
-
         // Execute
         halted = StepCPU();
         if (halted)
@@ -530,7 +731,7 @@ int main(int argc, char* argv[])
             haltReason = "idle";
         }
 
-        // Output trace (skip in summary mode)
+        // Output trace in normal mode (tracepoint trace already output above)
         if (!cfg.summary)
         {
             sOpCode* op = GetLastOpcode();
@@ -554,7 +755,7 @@ int main(int argc, char* argv[])
     if (!cfg.quiet && !cfg.summary)
     {
         fprintf(stderr, "\nExecution complete:\n");
-        fprintf(stderr, "  Instructions: %llu\n", (unsigned long long)step);
+        fprintf(stderr, "  Instructions: %" PRIu64 "\n", step);
         fprintf(stderr, "  Clocks:       %u (rough estimate)\n", ClockCycleCounter);
         fprintf(stderr, "  Final PC:     0x%04X\n", ProgramCounter);
         fprintf(stderr, "  Final ST:     0x%04X\n", Status);
@@ -571,9 +772,9 @@ int main(int argc, char* argv[])
     // Summary JSON output
     if (cfg.summary)
     {
-        fprintf(out, "{\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%u,\"steps\":%llu,\"halt\":\"%s\",\"r\":[",
+        fprintf(out, "{\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%" PRIu32 ",\"steps\":%" PRIu64 ",\"halt\":\"%s\",\"r\":[",
                 ProgramCounter, WorkspacePtr, Status, ClockCycleCounter,
-                (unsigned long long)step, haltReason);
+                step, haltReason);
         for (int i = 0; i < 16; i++)
         {
             UINT16 addr = (WorkspacePtr + i * 2) & 0xFFFE;

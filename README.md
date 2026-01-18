@@ -41,6 +41,12 @@ Output Options:
   -S, --summary         Output only final state as JSON (no per-step trace)
   -d, --dump=START:LEN  Dump memory range at exit (hex, can repeat)
 
+Tracepoint Options (require -S):
+  -t, --tracepoint=ADDR       Trace only this address (hex, can repeat)
+  -T, --tracepoint-file=FILE  Load tracepoint addresses from file
+  --tracepoint-max=N          Stop after N total tracepoint hits
+  --tracepoint-stop           Stop when all tracepoints hit at least once
+
 Other:
   -h, --help            Show help
 ```
@@ -100,6 +106,16 @@ Run silently, output only final state (for test harnesses):
 ./tms9900-trace -S test.bin
 ```
 
+Profile a function (trace only entry/exit points):
+```bash
+./tms9900-trace -q -S --tracepoint 0x6000 --tracepoint 0x6100 --tracepoint-stop program.bin
+```
+
+Trace specific addresses from a file:
+```bash
+./tms9900-trace -q -S --tracepoint-file tracepoints.txt program.bin
+```
+
 ## Summary Mode (Test Harness)
 
 The `-S, --summary` option runs silently and outputs a single JSON line with final CPU state:
@@ -112,8 +128,23 @@ Fields:
 - `pc`, `wp`, `st`: Final CPU registers (hex)
 - `clk`: Clock cycles (rough estimate)
 - `steps`: Instructions executed
-- `halt`: Stop reason (`"idle"`, `"stop"`, `"loop"`, `"max"`)
+- `halt`: Stop reason (`"idle"`, `"stop"`, `"loop"`, `"max"`, `"tracepoint-max"`, `"tracepoint-stop"`)
 - `r`: R0-R15 values (hex)
+
+## Tracepoints (Filtered Tracing)
+
+Tracepoints provide selective tracing - instead of tracing every instruction, only trace when PC matches a tracepoint address. This is useful for profiling specific functions without the overhead of full instruction tracing.
+
+Tracepoints require `-S` mode. Without `-S`, all instructions are traced anyway.
+
+Example output with `-q -S --tracepoint 0x6000 --tracepoint 0x6100 --tracepoint-stop`:
+```
+{"step":50,"pc":"6000","wp":"8300","st":"0000","clk":1000,"op":"LI","asm":"LI   R0,>0001","r":["0001",...]}
+{"step":120,"pc":"6100","wp":"8300","st":"C000","clk":2500,"op":"RT","asm":"RT","r":["0005",...]}
+{"pc":"6100","wp":"8300","st":"C000","clk":2500,"steps":120,"halt":"tracepoint-stop","r":["0005",...]}
+```
+
+Each tracepoint hit outputs a full trace line. The final line is the summary JSON. To measure function cycles, compute `clk` deltas between entry/exit trace lines.
 
 ## Memory Dumps
 
@@ -157,6 +188,8 @@ The simulator stops when:
 2. Stop address is reached (`-s` option)
 3. IDLE instruction executed (unless an interrupt wakes it)
 4. Infinite loop detected (PC unchanged after instruction)
+5. Tracepoint max hits reached (`--tracepoint-max`)
+6. All tracepoints hit at least once (`--tracepoint-stop`)
 
 ## Cycle Timing (Rough Estimate)
 
