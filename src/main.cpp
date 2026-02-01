@@ -9,6 +9,7 @@
 
 #include "cpu.hpp"
 #include "disasm.hpp"
+#include "gdb_stub.hpp"
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -53,10 +54,12 @@ struct Config
     UINT64 maxSteps = 1000000;
     std::vector<UINT16> stopAddrs;
     std::vector<ScheduledIRQ> irqs;
+    std::vector<PeriodicTimer> timers;
     std::vector<MemoryDump> dumps;
     std::vector<Tracepoint> tracepoints;
     UINT64 tracepointMax = 0;
     bool tracepointStop = false;
+    int gdbPort = 0;
     bool quiet = false;
     bool summary = false;
     bool entrySet = false;
@@ -79,6 +82,7 @@ static void PrintUsage(const char* prog)
     fprintf(stderr, "  -n, --max-steps=N     Max instructions (default: 1000000)\n");
     fprintf(stderr, "  -s, --stop-at=ADDR    Stop at address (hex, can repeat)\n");
     fprintf(stderr, "  --irq=LEVEL@STEP      Trigger interrupt at step (can repeat)\n");
+    fprintf(stderr, "  --timer=LEVEL:PERIOD  Periodic interrupt every PERIOD cycles (can repeat)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Output Options:\n");
     fprintf(stderr, "  -o, --output=FILE     Output file (default: stdout)\n");
@@ -92,6 +96,9 @@ static void PrintUsage(const char* prog)
     fprintf(stderr, "  --tracepoint-max=N        Stop after N total tracepoint hits\n");
     fprintf(stderr, "  --tracepoint-stop         Stop when all tracepoints hit at least once\n");
     fprintf(stderr, "\n");
+    fprintf(stderr, "GDB Debugging:\n");
+    fprintf(stderr, "  --gdb=PORT            Start GDB RSP server on PORT (e.g., --gdb=1234)\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "Other:\n");
     fprintf(stderr, "  -h, --help            Show this help\n");
     fprintf(stderr, "\n");
@@ -104,6 +111,7 @@ static void PrintUsage(const char* prog)
     fprintf(stderr, "  %s -l 0x6000 -e 0x6000 program.bin\n", prog);
     fprintf(stderr, "  %s -n 100 -o trace.ndjson test.bin\n", prog);
     fprintf(stderr, "  %s --irq=1@500 -s 0x6100 program.bin\n", prog);
+    fprintf(stderr, "  %s --timer=1:50000 -n 500000 program.bin\n", prog);
 }
 
 //----------------------------------------------------------------------------
@@ -158,6 +166,40 @@ static bool ParseIRQ(const char* str, ScheduledIRQ* irq)
 
     irq->level = level;
     irq->atStep = step;
+    return true;
+}
+
+//----------------------------------------------------------------------------
+// Parse periodic timer spec: LEVEL:PERIOD (e.g., "1:50000")
+//----------------------------------------------------------------------------
+
+static bool ParseTimer(const char* str, PeriodicTimer* timer)
+{
+    char* colon = (char*)strchr(str, ':');
+    if (!colon)
+    {
+        return false;
+    }
+
+    *colon = '\0';
+    int level = atoi(str);
+    *colon = ':';
+
+    if (level < 0 || level > 15)
+    {
+        return false;
+    }
+
+    char* end;
+    UINT64 period = strtoull(colon + 1, &end, 10);
+    if (*end != '\0' || period == 0)
+    {
+        return false;
+    }
+
+    timer->irqLevel = level;
+    timer->periodCycles = period;
+    timer->nextTriggerCycle = period;  // First trigger after one period
     return true;
 }
 
@@ -371,6 +413,7 @@ int main(int argc, char* argv[])
         {"max-steps",      required_argument, nullptr, 'n'},
         {"stop-at",        required_argument, nullptr, 's'},
         {"irq",            required_argument, nullptr, 'i'},
+        {"timer",          required_argument, nullptr, 'R'},
         {"output",         required_argument, nullptr, 'o'},
         {"dump",           required_argument, nullptr, 'd'},
         {"tracepoint",     required_argument, nullptr, 't'},
@@ -379,6 +422,7 @@ int main(int argc, char* argv[])
         {"tracepoint-stop", no_argument,      nullptr, 'P'},
         {"quiet",          no_argument,       nullptr, 'q'},
         {"summary",        no_argument,       nullptr, 'S'},
+        {"gdb",            required_argument, nullptr, 'G'},
         {"help",           no_argument,       nullptr, 'h'},
         {nullptr,          0,                 nullptr, 0}
     };
@@ -441,6 +485,17 @@ int main(int argc, char* argv[])
                 cfg.irqs.push_back(irq);
                 break;
             }
+            case 'R':
+            {
+                PeriodicTimer timer;
+                if (!ParseTimer(optarg, &timer))
+                {
+                    fprintf(stderr, "Error: Invalid timer spec '%s' (use LEVEL:PERIOD, e.g., 1:50000)\n", optarg);
+                    return 1;
+                }
+                cfg.timers.push_back(timer);
+                break;
+            }
             case 'o':
                 cfg.outputFile = optarg;
                 break;
@@ -486,6 +541,14 @@ int main(int argc, char* argv[])
                 break;
             case 'S':
                 cfg.summary = true;
+                break;
+            case 'G':
+                cfg.gdbPort = atoi(optarg);
+                if (cfg.gdbPort <= 0 || cfg.gdbPort > 65535)
+                {
+                    fprintf(stderr, "Error: Invalid GDB port '%s'\n", optarg);
+                    return 1;
+                }
                 break;
             case 'h':
                 PrintUsage(argv[0]);
@@ -552,6 +615,13 @@ int main(int argc, char* argv[])
     ClockCycleCounter = 0;
     InstructionCounter = 0;
 
+    // GDB mode: start RSP server instead of batch execution
+    if (cfg.gdbPort > 0)
+    {
+        if (cfg.outputFile) fclose(out);
+        return gdb_main(cfg.gdbPort, cfg.timers);
+    }
+
     if (!cfg.quiet && !cfg.summary)
     {
         fprintf(stderr, "TMS9900 Trace\n");
@@ -575,6 +645,15 @@ int main(int argc, char* argv[])
             for (const auto& irq : cfg.irqs)
             {
                 fprintf(stderr, " %d@%" PRIu64, irq.level, irq.atStep);
+            }
+            fprintf(stderr, "\n");
+        }
+        if (!cfg.timers.empty())
+        {
+            fprintf(stderr, "  Timers:");
+            for (const auto& t : cfg.timers)
+            {
+                fprintf(stderr, " level %d every %" PRIu64 " cycles", t.irqLevel, t.periodCycles);
             }
             fprintf(stderr, "\n");
         }
@@ -619,6 +698,16 @@ int main(int argc, char* argv[])
                         step, cfg.irqs[nextIRQ].level);
             }
             nextIRQ++;
+        }
+
+        // Check for periodic timer interrupts
+        for (auto& t : cfg.timers)
+        {
+            if (ClockCycleCounter >= t.nextTriggerCycle)
+            {
+                TriggerInterrupt(t.irqLevel);
+                t.nextTriggerCycle += t.periodCycles;
+            }
         }
 
         // Capture pre-state
@@ -713,7 +802,8 @@ int main(int argc, char* argv[])
         }
 
         // Check for infinite loop (JMP $)
-        if (pc == lastPC)
+        // Skip when periodic timers are active - idle loops are legitimate
+        if (pc == lastPC && cfg.timers.empty())
         {
             if (!cfg.quiet && !cfg.summary)
             {

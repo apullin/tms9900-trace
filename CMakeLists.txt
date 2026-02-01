@@ -34,6 +34,7 @@ set(SOURCES
     src/main.cpp
     src/cpu.cpp
     src/disasm.cpp
+    src/gdb_stub.cpp
 )
 
 # Executable
