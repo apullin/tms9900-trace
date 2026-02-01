@@ -7,11 +7,15 @@
 // Supports: register read/write, memory read/write, breakpoints,
 // single-step, continue, target description XML.
 //
-// Register model (19 registers, all 16-bit):
+// Register model (19 registers, all 16-bit big-endian):
 //   0-15: R0-R15 (workspace registers, read from Memory[WP+reg*2])
 //   16:   PC (Program Counter)
 //   17:   WP (Workspace Pointer)
 //   18:   ST (Status Register)
+//
+// Uses GDB Target Description XML (tdesc) to define registers without
+// requiring a known architecture. GDB accepts the register layout
+// from the stub and uses it for register display and DWARF mapping.
 //----------------------------------------------------------------------------
 
 #include "gdb_stub.hpp"
@@ -32,35 +36,41 @@
 // Target description XML (served to GDB via qXfer:features:read)
 //----------------------------------------------------------------------------
 
-// Use msp430 architecture so GDB accepts our 16-bit register description.
-// MSP430 is a TI 16-bit CPU with r0-r15, close enough to TMS9900.
-// GDB's MSP430 support expects: r0(PC), r1(SP), r2(SR), r3(CG), r4-r15.
-// We present our 16 workspace registers as r0-r15 and map PC/WP/ST
-// to the MSP430 slots GDB expects (pc, sp, sr).
-// Disassembly will be wrong (MSP430 opcodes != TMS9900) but register
-// inspection, memory access, breakpoints, and stepping all work.
+// Target description XML for TMS9900.
+//
+// GDB requires a known <architecture> to accept any target description.
+// We use "msp430" (another TI 16-bit CPU) as the architecture hint --
+// this just tells GDB to use 16-bit register handling internally.
+// The register names, layout, and DWARF numbering are pure TMS9900.
+//
+// MSP430's required feature "org.gnu.gdb.msp430.core" expects r0-r15
+// as 32-bit values.  We map them as:
+//   r0  (pc)  = TMS9900 PC      r1 (sp) = TMS9900 WP
+//   r2  (sr)  = TMS9900 ST      r3-r15  = TMS9900 R0-R12
+//
+// TMS9900 R13-R15 are accessible via memory: x/3xh <WP+26>
 static const char* targetXML =
     "<?xml version=\"1.0\"?>\n"
     "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n"
     "<target version=\"1.0\">\n"
     "  <architecture>msp430</architecture>\n"
     "  <feature name=\"org.gnu.gdb.msp430.core\">\n"
-    "    <reg name=\"r0\"  bitsize=\"16\" type=\"code_ptr\" regnum=\"0\"/>\n"
-    "    <reg name=\"r1\"  bitsize=\"16\" type=\"data_ptr\" regnum=\"1\"/>\n"
-    "    <reg name=\"r2\"  bitsize=\"16\" regnum=\"2\"/>\n"
-    "    <reg name=\"r3\"  bitsize=\"16\" regnum=\"3\"/>\n"
-    "    <reg name=\"r4\"  bitsize=\"16\" regnum=\"4\"/>\n"
-    "    <reg name=\"r5\"  bitsize=\"16\" regnum=\"5\"/>\n"
-    "    <reg name=\"r6\"  bitsize=\"16\" regnum=\"6\"/>\n"
-    "    <reg name=\"r7\"  bitsize=\"16\" regnum=\"7\"/>\n"
-    "    <reg name=\"r8\"  bitsize=\"16\" regnum=\"8\"/>\n"
-    "    <reg name=\"r9\"  bitsize=\"16\" regnum=\"9\"/>\n"
-    "    <reg name=\"r10\" bitsize=\"16\" regnum=\"10\"/>\n"
-    "    <reg name=\"r11\" bitsize=\"16\" regnum=\"11\"/>\n"
-    "    <reg name=\"r12\" bitsize=\"16\" regnum=\"12\"/>\n"
-    "    <reg name=\"r13\" bitsize=\"16\" regnum=\"13\"/>\n"
-    "    <reg name=\"r14\" bitsize=\"16\" regnum=\"14\"/>\n"
-    "    <reg name=\"r15\" bitsize=\"16\" regnum=\"15\"/>\n"
+    "    <reg name=\"pc\"  bitsize=\"32\" type=\"code_ptr\" regnum=\"0\"/>\n"
+    "    <reg name=\"wp\"  bitsize=\"32\" type=\"data_ptr\" regnum=\"1\"/>\n"
+    "    <reg name=\"st\"  bitsize=\"32\" regnum=\"2\"/>\n"
+    "    <reg name=\"r0\"  bitsize=\"32\" regnum=\"3\"/>\n"
+    "    <reg name=\"r1\"  bitsize=\"32\" regnum=\"4\"/>\n"
+    "    <reg name=\"r2\"  bitsize=\"32\" regnum=\"5\"/>\n"
+    "    <reg name=\"r3\"  bitsize=\"32\" regnum=\"6\"/>\n"
+    "    <reg name=\"r4\"  bitsize=\"32\" regnum=\"7\"/>\n"
+    "    <reg name=\"r5\"  bitsize=\"32\" regnum=\"8\"/>\n"
+    "    <reg name=\"r6\"  bitsize=\"32\" regnum=\"9\"/>\n"
+    "    <reg name=\"r7\"  bitsize=\"32\" regnum=\"10\"/>\n"
+    "    <reg name=\"r8\"  bitsize=\"32\" regnum=\"11\"/>\n"
+    "    <reg name=\"r9\"  bitsize=\"32\" regnum=\"12\"/>\n"
+    "    <reg name=\"r10\" bitsize=\"32\" regnum=\"13\"/>\n"
+    "    <reg name=\"r11\" bitsize=\"32\" regnum=\"14\"/>\n"
+    "    <reg name=\"r12\" bitsize=\"32\" regnum=\"15\"/>\n"
     "  </feature>\n"
     "</target>\n";
 
@@ -84,21 +94,7 @@ static void hex_byte(char* buf, UINT8 val)
     buf[1] = hexchars[val & 0xF];
 }
 
-// Big-endian (for memory display)
-static void hex_word_be(char* buf, UINT16 val)
-{
-    hex_byte(buf, (val >> 8) & 0xFF);
-    hex_byte(buf + 2, val & 0xFF);
-}
-
-// Little-endian 16-bit
-static void hex_word(char* buf, UINT16 val)
-{
-    hex_byte(buf, val & 0xFF);
-    hex_byte(buf + 2, (val >> 8) & 0xFF);
-}
-
-// Little-endian 32-bit (for MSP430 register encoding - GDB expects 4 bytes per reg)
+// Little-endian 32-bit register encoding (GDB MSP430 protocol expects this)
 static void hex_reg(char* buf, UINT16 val)
 {
     hex_byte(buf,     val & 0xFF);
@@ -202,14 +198,14 @@ static void fire_timers(std::vector<PeriodicTimer>& timers)
 //----------------------------------------------------------------------------
 // Register access (no clock side effects)
 //
-// MSP430 register mapping (16 registers):
-//   r0  = TMS9900 PC  (MSP430 convention: r0 is PC)
-//   r1  = TMS9900 WP  (MSP430 convention: r1 is SP)
-//   r2  = TMS9900 ST  (MSP430 convention: r2 is SR)
-//   r3  = TMS9900 R0  (first workspace register)
-//   r4  = TMS9900 R1
+// GDB register mapping (16 registers, MSP430 compatible):
+//   r0  (pc)  = TMS9900 Program Counter
+//   r1  (wp)  = TMS9900 Workspace Pointer
+//   r2  (st)  = TMS9900 Status Register
+//   r3  (r0)  = TMS9900 workspace R0
+//   r4  (r1)  = TMS9900 workspace R1
 //   ...
-//   r15 = TMS9900 R12
+//   r15 (r12) = TMS9900 workspace R12
 //
 // TMS9900 R13-R15 are accessible via memory: x/3xh <WP+26>
 //----------------------------------------------------------------------------
@@ -223,7 +219,6 @@ static UINT16 read_reg(int regnum)
     if (regnum == 2) return Status;
     if (regnum >= 3 && regnum <= 15)
     {
-        // r3-r15 → TMS9900 workspace R0-R12
         int wreg = regnum - 3;
         UINT16 addr = (WorkspacePtr + wreg * 2) & 0xFFFE;
         return (Memory[addr] << 8) | Memory[addr + 1];
@@ -371,7 +366,7 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
             if (eq)
             {
                 int regnum = (int)parse_hex(pkt.c_str() + 1, nullptr);
-                // GDB sends 32-bit LE: parse first 4 hex chars (low 16 bits)
+                // 32-bit LE: parse first 4 hex chars (low 16 bits)
                 const char* vp = eq + 1;
                 int h0 = hex_val(vp[0]), h1 = hex_val(vp[1]);
                 int h2 = hex_val(vp[2]), h3 = hex_val(vp[3]);
