@@ -32,14 +32,21 @@
 // Target description XML (served to GDB via qXfer:features:read)
 //----------------------------------------------------------------------------
 
+// Use msp430 architecture so GDB accepts our 16-bit register description.
+// MSP430 is a TI 16-bit CPU with r0-r15, close enough to TMS9900.
+// GDB's MSP430 support expects: r0(PC), r1(SP), r2(SR), r3(CG), r4-r15.
+// We present our 16 workspace registers as r0-r15 and map PC/WP/ST
+// to the MSP430 slots GDB expects (pc, sp, sr).
+// Disassembly will be wrong (MSP430 opcodes != TMS9900) but register
+// inspection, memory access, breakpoints, and stepping all work.
 static const char* targetXML =
     "<?xml version=\"1.0\"?>\n"
     "<!DOCTYPE target SYSTEM \"gdb-target.dtd\">\n"
     "<target version=\"1.0\">\n"
-    "  <architecture>tms9900</architecture>\n"
-    "  <feature name=\"org.ti.tms9900.core\">\n"
-    "    <reg name=\"r0\"  bitsize=\"16\" regnum=\"0\"/>\n"
-    "    <reg name=\"r1\"  bitsize=\"16\" regnum=\"1\"/>\n"
+    "  <architecture>msp430</architecture>\n"
+    "  <feature name=\"org.gnu.gdb.msp430.core\">\n"
+    "    <reg name=\"r0\"  bitsize=\"16\" type=\"code_ptr\" regnum=\"0\"/>\n"
+    "    <reg name=\"r1\"  bitsize=\"16\" type=\"data_ptr\" regnum=\"1\"/>\n"
     "    <reg name=\"r2\"  bitsize=\"16\" regnum=\"2\"/>\n"
     "    <reg name=\"r3\"  bitsize=\"16\" regnum=\"3\"/>\n"
     "    <reg name=\"r4\"  bitsize=\"16\" regnum=\"4\"/>\n"
@@ -54,9 +61,6 @@ static const char* targetXML =
     "    <reg name=\"r13\" bitsize=\"16\" regnum=\"13\"/>\n"
     "    <reg name=\"r14\" bitsize=\"16\" regnum=\"14\"/>\n"
     "    <reg name=\"r15\" bitsize=\"16\" regnum=\"15\"/>\n"
-    "    <reg name=\"pc\"  bitsize=\"16\" type=\"code_ptr\" regnum=\"16\"/>\n"
-    "    <reg name=\"wp\"  bitsize=\"16\" type=\"data_ptr\" regnum=\"17\"/>\n"
-    "    <reg name=\"st\"  bitsize=\"16\" regnum=\"18\"/>\n"
     "  </feature>\n"
     "</target>\n";
 
@@ -80,10 +84,27 @@ static void hex_byte(char* buf, UINT8 val)
     buf[1] = hexchars[val & 0xF];
 }
 
-static void hex_word(char* buf, UINT16 val)
+// Big-endian (for memory display)
+static void hex_word_be(char* buf, UINT16 val)
 {
     hex_byte(buf, (val >> 8) & 0xFF);
     hex_byte(buf + 2, val & 0xFF);
+}
+
+// Little-endian 16-bit
+static void hex_word(char* buf, UINT16 val)
+{
+    hex_byte(buf, val & 0xFF);
+    hex_byte(buf + 2, (val >> 8) & 0xFF);
+}
+
+// Little-endian 32-bit (for MSP430 register encoding - GDB expects 4 bytes per reg)
+static void hex_reg(char* buf, UINT16 val)
+{
+    hex_byte(buf,     val & 0xFF);
+    hex_byte(buf + 2, (val >> 8) & 0xFF);
+    hex_byte(buf + 4, 0);
+    hex_byte(buf + 6, 0);
 }
 
 static unsigned long parse_hex(const char* s, const char** endp)
@@ -180,32 +201,48 @@ static void fire_timers(std::vector<PeriodicTimer>& timers)
 
 //----------------------------------------------------------------------------
 // Register access (no clock side effects)
+//
+// MSP430 register mapping (16 registers):
+//   r0  = TMS9900 PC  (MSP430 convention: r0 is PC)
+//   r1  = TMS9900 WP  (MSP430 convention: r1 is SP)
+//   r2  = TMS9900 ST  (MSP430 convention: r2 is SR)
+//   r3  = TMS9900 R0  (first workspace register)
+//   r4  = TMS9900 R1
+//   ...
+//   r15 = TMS9900 R12
+//
+// TMS9900 R13-R15 are accessible via memory: x/3xh <WP+26>
 //----------------------------------------------------------------------------
+
+#define NUM_REGS 16
 
 static UINT16 read_reg(int regnum)
 {
-    if (regnum >= 0 && regnum <= 15)
+    if (regnum == 0) return ProgramCounter;
+    if (regnum == 1) return WorkspacePtr;
+    if (regnum == 2) return Status;
+    if (regnum >= 3 && regnum <= 15)
     {
-        UINT16 addr = (WorkspacePtr + regnum * 2) & 0xFFFE;
+        // r3-r15 → TMS9900 workspace R0-R12
+        int wreg = regnum - 3;
+        UINT16 addr = (WorkspacePtr + wreg * 2) & 0xFFFE;
         return (Memory[addr] << 8) | Memory[addr + 1];
     }
-    if (regnum == 16) return ProgramCounter;
-    if (regnum == 17) return WorkspacePtr;
-    if (regnum == 18) return Status;
     return 0;
 }
 
 static void write_reg(int regnum, UINT16 val)
 {
-    if (regnum >= 0 && regnum <= 15)
+    if (regnum == 0) ProgramCounter = val;
+    else if (regnum == 1) WorkspacePtr = val;
+    else if (regnum == 2) Status = val;
+    else if (regnum >= 3 && regnum <= 15)
     {
-        UINT16 addr = (WorkspacePtr + regnum * 2) & 0xFFFE;
+        int wreg = regnum - 3;
+        UINT16 addr = (WorkspacePtr + wreg * 2) & 0xFFFE;
         Memory[addr] = (val >> 8) & 0xFF;
         Memory[addr + 1] = val & 0xFF;
     }
-    else if (regnum == 16) ProgramCounter = val;
-    else if (regnum == 17) WorkspacePtr = val;
-    else if (regnum == 18) Status = val;
 }
 
 //----------------------------------------------------------------------------
@@ -287,23 +324,27 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         //--- Read all registers ---
         else if (pkt[0] == 'g')
         {
-            char buf[19 * 4 + 1];
-            for (int i = 0; i < 19; i++)
-                hex_word(buf + i * 4, read_reg(i));
-            buf[19 * 4] = '\0';
+            char buf[NUM_REGS * 8 + 1];
+            for (int i = 0; i < NUM_REGS; i++)
+                hex_reg(buf + i * 8, read_reg(i));
+            buf[NUM_REGS * 8] = '\0';
             reply = buf;
         }
         //--- Write all registers ---
         else if (pkt[0] == 'G')
         {
             const char* p = pkt.c_str() + 1;
-            for (int i = 0; i < 19 && p[0] && p[1] && p[2] && p[3]; i++)
+            for (int i = 0; i < NUM_REGS; i++)
             {
+                // 8 hex chars per reg (32-bit LE), we use low 16 bits
+                if (!p[0] || !p[1] || !p[2] || !p[3]) break;
                 int h0 = hex_val(p[0]), h1 = hex_val(p[1]);
                 int h2 = hex_val(p[2]), h3 = hex_val(p[3]);
                 if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) break;
-                write_reg(i, (h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
-                p += 4;
+                UINT8 lo = (h0 << 4) | h1;
+                UINT8 hi = (h2 << 4) | h3;
+                write_reg(i, (hi << 8) | lo);
+                p += 8;  // Skip full 32-bit value (ignore upper 16 bits)
             }
             reply = "OK";
         }
@@ -311,11 +352,11 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         else if (pkt[0] == 'p')
         {
             int regnum = (int)parse_hex(pkt.c_str() + 1, nullptr);
-            if (regnum >= 0 && regnum <= 18)
+            if (regnum >= 0 && regnum < NUM_REGS)
             {
-                char buf[5];
-                hex_word(buf, read_reg(regnum));
-                buf[4] = '\0';
+                char buf[9];
+                hex_reg(buf, read_reg(regnum));
+                buf[8] = '\0';
                 reply = buf;
             }
             else
@@ -330,8 +371,14 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
             if (eq)
             {
                 int regnum = (int)parse_hex(pkt.c_str() + 1, nullptr);
-                UINT16 val = (UINT16)parse_hex(eq + 1, nullptr);
-                if (regnum >= 0 && regnum <= 18)
+                // GDB sends 32-bit LE: parse first 4 hex chars (low 16 bits)
+                const char* vp = eq + 1;
+                int h0 = hex_val(vp[0]), h1 = hex_val(vp[1]);
+                int h2 = hex_val(vp[2]), h3 = hex_val(vp[3]);
+                UINT8 lo = (h0 >= 0 && h1 >= 0) ? ((h0 << 4) | h1) : 0;
+                UINT8 hi = (h2 >= 0 && h3 >= 0) ? ((h2 << 4) | h3) : 0;
+                UINT16 val = (hi << 8) | lo;
+                if (regnum >= 0 && regnum < NUM_REGS)
                 {
                     write_reg(regnum, val);
                     reply = "OK";
