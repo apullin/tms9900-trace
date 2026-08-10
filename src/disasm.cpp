@@ -10,277 +10,260 @@
 
 #include "disasm.hpp"
 #include "cpu.hpp"
+
 #include <cstdio>
 #include <cstring>
 
-static int bUseR = 1;
-static char* pBuffer;
-static UINT16 ByteTable[256 + 1];
+namespace {
 
-static bool InitByteTable()
+class BufferWriter
 {
-    for (unsigned i = 0; i < 256; i++)
+public:
+    BufferWriter(char* buffer, size_t size)
+        : buffer_(buffer), size_(size), length_(0)
     {
-        sprintf((char*)&ByteTable[i], "%02X", i);
-    }
-    return true;
-}
-
-static bool initialized = InitByteTable();
-
-static void AddDigit(int num)
-{
-    static const char* values[17] =
-    {
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"
-    };
-
-    memcpy(pBuffer, values[num], 2);
-    pBuffer += (num < 10) ? 1 : 2;
-}
-
-static void AddReg(int reg)
-{
-    if (bUseR)
-    {
-        static const char* registers[16] =
+        if (size_ != 0)
         {
-            "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15"
-        };
-
-        memcpy(pBuffer, registers[reg], 3);
-        pBuffer += (reg < 10) ? 2 : 3;
+            buffer_[0] = '\0';
+        }
     }
-    else
+
+    void Append(char value)
     {
-        AddDigit(reg);
+        if (length_ + 1 < size_)
+        {
+            buffer_[length_] = value;
+        }
+        length_++;
+        Terminate();
     }
+
+    void Append(const char* value)
+    {
+        while (*value != '\0')
+        {
+            Append(*value++);
+        }
+    }
+
+    void AppendHexByte(UINT8 value)
+    {
+        static constexpr char Hex[] = "0123456789ABCDEF";
+        Append(Hex[value >> 4]);
+        Append(Hex[value & 0x0F]);
+    }
+
+    void AppendHexWord(UINT16 value)
+    {
+        AppendHexByte(static_cast<UINT8>(value >> 8));
+        AppendHexByte(static_cast<UINT8>(value));
+    }
+
+    void AppendUnsigned(unsigned value)
+    {
+        char digits[12];
+        std::snprintf(digits, sizeof(digits), "%u", value);
+        Append(digits);
+    }
+
+    void PadTo(size_t column)
+    {
+        while (length_ < column)
+        {
+            Append(' ');
+        }
+    }
+
+private:
+    void Terminate()
+    {
+        if (size_ == 0)
+        {
+            return;
+        }
+        const size_t terminator = length_ < size_ ? length_ : size_ - 1;
+        buffer_[terminator] = '\0';
+    }
+
+    char* buffer_;
+    size_t size_;
+    size_t length_;
+};
+
+UINT16 ReadRawWord(UINT16 address)
+{
+    const UINT16 next = static_cast<UINT16>(address + 1);
+    return static_cast<UINT16>((static_cast<UINT16>(Memory[address]) << 8) |
+                               Memory[next]);
 }
 
-static void AddByte(UINT8 data)
+UINT16 FetchExtension(UINT16& nextAddress)
 {
-    memcpy(pBuffer, ByteTable + data, 2);
-    pBuffer += 2;
+    const UINT16 value = ReadRawWord(nextAddress);
+    nextAddress = static_cast<UINT16>(nextAddress + 2);
+    return value;
 }
 
-static void AddWord(UINT16 data)
+void AppendRegister(BufferWriter& out, unsigned reg)
 {
-    memcpy(pBuffer, ByteTable + (data >> 8), 2);
-    memcpy(pBuffer + 2, ByteTable + (data & 0x00FF), 2);
-    pBuffer += 4;
+    out.Append('R');
+    out.AppendUnsigned(reg & 0x0F);
 }
 
-static inline UINT16 GetWord(const UINT8* ptr)
+void AppendGeneralAddress(BufferWriter& out, UINT16 specification,
+                          UINT16& nextAddress)
 {
-    return (UINT16)((ptr[0] << 8) | ptr[1]);
-}
+    const unsigned reg = specification & 0x0F;
+    const unsigned mode = (specification >> 4) & 0x03;
 
-static void GetRegs(UINT16 op, UINT16 data)
-{
-    int reg = op & 0x0F;
-    int mode = (op >> 4) & 0x03;
     switch (mode)
     {
         case 0:
-            AddReg(reg);
+            AppendRegister(out, reg);
             break;
+
+        case 1:
+            out.Append('*');
+            AppendRegister(out, reg);
+            break;
+
         case 2:
-            *pBuffer++ = '@';
-            *pBuffer++ = '>';
-            AddWord(data);
+        {
+            const UINT16 extension = FetchExtension(nextAddress);
+            out.Append("@>");
+            out.AppendHexWord(extension);
             if (reg != 0)
             {
-                *pBuffer++ = '(';
-                AddReg(reg);
-                *pBuffer++ = ')';
+                out.Append('(');
+                AppendRegister(out, reg);
+                out.Append(')');
             }
             break;
-        case 1:
+        }
+
         case 3:
-            *pBuffer++ = '*';
-            AddReg(reg);
-            if (mode == 3)
-            {
-                *pBuffer++ = '+';
-            }
+            out.Append('*');
+            AppendRegister(out, reg);
+            out.Append('+');
             break;
     }
 }
 
-static void format_I(UINT16 opcode, UINT16 arg1, UINT16 arg2)
+void AppendOperands(BufferWriter& out, const sOpCode& operation,
+                    UINT16 opcode, UINT16& nextAddress)
 {
-    GetRegs(opcode, arg1);
-    *pBuffer++ = ',';
-    GetRegs((UINT16)(opcode >> 6), arg2);
-}
-
-static void format_II(UINT16 opcode, UINT16 PC)
-{
-    if (opcode == 0x1000)
+    switch (operation.format)
     {
-        strcpy(pBuffer - 5, "NOP");
-    }
-    else
-    {
-        int disp = (INT8)opcode;
-        *pBuffer++ = '>';
-        if (opcode >= 0x1D00)
-        {
-            AddByte((UINT8)disp);
-        }
-        else
-        {
-            AddWord((UINT16)(PC + disp * 2));
-        }
-    }
-}
+        case 1: // Two general addresses.
+            AppendGeneralAddress(out, opcode, nextAddress);
+            out.Append(',');
+            AppendGeneralAddress(out, static_cast<UINT16>(opcode >> 6),
+                                 nextAddress);
+            break;
 
-static void format_III(UINT16 opcode, UINT16 arg1)
-{
-    GetRegs(opcode, arg1);
-    *pBuffer++ = ',';
-    AddReg((opcode >> 6) & 0xF);
-}
-
-static void format_IV(UINT16 opcode, UINT16 arg1)
-{
-    GetRegs(opcode, arg1);
-    UINT8 disp = (UINT8)((opcode >> 6) & 0xF);
-    *pBuffer++ = ',';
-    AddDigit(disp ? disp : 16);
-}
-
-static void format_V(UINT16 opcode)
-{
-    AddReg(opcode & 0xF);
-    *pBuffer++ = ',';
-    AddDigit((opcode >> 4) & 0xF);
-}
-
-static void format_VI(UINT16 opcode, UINT16 arg1)
-{
-    GetRegs(opcode, arg1);
-}
-
-static void format_VIII(UINT16 opcode, UINT16 arg1)
-{
-    if (opcode < 0x02A0)
-    {
-        AddReg(opcode & 0x000F);
-        *pBuffer++ = ',';
-        *pBuffer++ = '>';
-        AddWord(arg1);
-    }
-    else if (opcode >= 0x02E0)
-    {
-        *pBuffer++ = '>';
-        AddWord(arg1);
-    }
-    else
-    {
-        AddReg(opcode & 0x000F);
-    }
-}
-
-static int GetArgs(UINT16 PC, const UINT8* ptr, const sOpCode* op, UINT16 opcode)
-{
-    UINT16 arg1 = 0, arg2 = 0;
-    void (*format)(UINT16, UINT16);
-    int index = 0;
-
-    switch (op->format)
-    {
-        case 1:  // Two General Addresses
-            if ((opcode & 0x0030) == 0x0020)
+        case 2: // Relative branch or CRU bit displacement.
+            out.Append('>');
+            if (opcode >= 0x1D00)
             {
-                index += 2;
-                arg1 = GetWord(&ptr[index]);
+                out.AppendHexByte(static_cast<UINT8>(opcode));
             }
-            if ((opcode & 0x0C00) == 0x0800)
+            else
             {
-                index += 2;
-                arg2 = GetWord(&ptr[index]);
+                const INT8 displacement = static_cast<INT8>(opcode);
+                out.AppendHexWord(static_cast<UINT16>(
+                    nextAddress + static_cast<INT16>(displacement) * 2));
             }
-            format_I(opcode, arg1, arg2);
-            return index;
+            break;
 
-        case 2:
-            format_II(opcode, PC);
-            return 0;
+        case 3:
+            AppendGeneralAddress(out, opcode, nextAddress);
+            out.Append(',');
+            AppendRegister(out, (opcode >> 6) & 0x0F);
+            break;
+
+        case 4:
+            AppendGeneralAddress(out, opcode, nextAddress);
+            out.Append(',');
+            out.AppendUnsigned(((opcode >> 6) & 0x0F) != 0
+                                   ? (opcode >> 6) & 0x0F
+                                   : 16);
+            break;
 
         case 5:
-            format_V(opcode);
-            return 0;
+            AppendRegister(out, opcode & 0x0F);
+            out.Append(',');
+            out.AppendUnsigned((opcode >> 4) & 0x0F);
+            break;
 
-        case 3:
-            format = format_III;
-            break;
-        case 4:
-            format = format_IV;
-            break;
         case 6:
-            format = format_VI;
+            AppendGeneralAddress(out, opcode, nextAddress);
             break;
-        case 9:
-            format = format_III;
-            break;
-        case 8:  // Immediate
-            if ((opcode < 0x02A0) || (opcode >= 0x02E0))
-            {
-                index += 2;
-                arg1 = GetWord(&ptr[index]);
-            }
-            format_VIII(opcode, arg1);
-            return index;
+
         case 7:
-            return 0;
+            break;
+
+        case 8:
+            if (opcode < 0x02A0)
+            {
+                AppendRegister(out, opcode & 0x0F);
+                out.Append(",>");
+                out.AppendHexWord(FetchExtension(nextAddress));
+            }
+            else if (opcode >= 0x02E0)
+            {
+                out.Append('>');
+                out.AppendHexWord(FetchExtension(nextAddress));
+            }
+            else
+            {
+                AppendRegister(out, opcode & 0x0F);
+            }
+            break;
+
+        case 9:
+            AppendGeneralAddress(out, opcode, nextAddress);
+            out.Append(',');
+            if (std::strcmp(operation.mnemonic, "XOP") == 0)
+            {
+                out.AppendUnsigned((opcode >> 6) & 0x0F);
+            }
+            else
+            {
+                AppendRegister(out, (opcode >> 6) & 0x0F);
+            }
+            break;
+
         default:
-            return 0;
+            break;
     }
-
-    if ((opcode & 0x0030) == 0x0020)
-    {
-        index += 2;
-        arg1 = GetWord(&ptr[index]);
-    }
-
-    format(opcode, arg1);
-
-    return index;
 }
 
-UINT16 DisassembleASM(UINT16 PC, const UINT8* ptr, char* buffer)
+} // namespace
+
+UINT16 DisassembleASM(UINT16 address, char* buffer, size_t bufferSize)
 {
-    pBuffer = buffer;
-    AddWord(PC);
-    *pBuffer++ = ' ';
+    BufferWriter out(buffer, bufferSize);
+    out.AppendHexWord(address);
+    out.Append(' ');
 
-    if (PC & 1)
+    if ((address & 1) != 0)
     {
-        strcpy(pBuffer, "<-- Illegal value in PC");
-        return (UINT16)(PC + 1);
+        out.Append("<-- Illegal value in PC");
+        return static_cast<UINT16>(address + 1);
     }
 
-    UINT16 curOpCode = GetWord(ptr);
-    PC += (UINT16)2;
+    const UINT16 opcode = ReadRawWord(address);
+    UINT16 nextAddress = static_cast<UINT16>(address + 2);
+    const sOpCode* operation = LookupOpCode(opcode);
 
-    sOpCode* op = LookupOpCode(curOpCode);
+    const bool isNop = opcode == 0x1000;
+    out.Append(isNop ? "NOP" : operation->mnemonic);
 
-    if (op == nullptr)
+    if (!isNop && operation->format != 7 && operation->format != 0)
     {
-        strcpy(pBuffer, "Invalid Op-Code");
-        return PC;
+        out.PadTo(10);
+        AppendOperands(out, *operation, opcode, nextAddress);
     }
 
-    memcpy(pBuffer, op->mnemonic, 5);
-
-    if (op->format != 7)
-    {
-        while (*pBuffer && (pBuffer < buffer + 9)) pBuffer++;
-        while (pBuffer < buffer + 10) *pBuffer++ = ' ';
-        PC += (UINT16)GetArgs(PC, ptr, op, curOpCode);
-        *pBuffer = '\0';
-    }
-
-    return PC;
+    return nextAddress;
 }

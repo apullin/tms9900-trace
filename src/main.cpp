@@ -10,6 +10,8 @@
 #include "cpu.hpp"
 #include "disasm.hpp"
 #include "gdb_stub.hpp"
+#include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -35,13 +37,13 @@ struct ScheduledIRQ
 struct MemoryDump
 {
     UINT16 start;
-    UINT16 length;
+    UINT32 length;
 };
 
 struct Tracepoint
 {
     UINT16 pc;
-    UINT32 hits = 0;
+    UINT64 hits = 0;
 };
 
 struct Config
@@ -58,7 +60,9 @@ struct Config
     std::vector<MemoryDump> dumps;
     std::vector<Tracepoint> tracepoints;
     UINT64 tracepointMax = 0;
+    UINT32 waitStates = 0;
     bool tracepointStop = false;
+    bool loopDetect = true;
     int gdbPort = 0;
     bool quiet = false;
     bool summary = false;
@@ -83,6 +87,8 @@ static void PrintUsage(const char* prog)
     fprintf(stderr, "  -s, --stop-at=ADDR    Stop at address (hex, can repeat)\n");
     fprintf(stderr, "  --irq=LEVEL@STEP      Trigger interrupt at step (can repeat)\n");
     fprintf(stderr, "  --timer=LEVEL:PERIOD  Periodic interrupt every PERIOD cycles (can repeat)\n");
+    fprintf(stderr, "  --wait-states=N       Add N clocks per modeled memory access\n");
+    fprintf(stderr, "  --no-loop-detect      Do not stop on a repeated instruction PC\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Output Options:\n");
     fprintf(stderr, "  -o, --output=FILE     Output file (default: stdout)\n");
@@ -296,13 +302,14 @@ static bool ParseDump(const char* str, MemoryDump* dump)
         length = strtoul(colon + 1, &end, 10);
     }
 
-    if (*end != '\0' || length == 0 || length > 0x10000)
+    if (*end != '\0' || length == 0 || length > 0x10000 ||
+        static_cast<unsigned long>(start) + length > 0x10000)
     {
         return false;
     }
 
     dump->start = start;
-    dump->length = (UINT16)length;
+    dump->length = static_cast<UINT32>(length);
     return true;
 }
 
@@ -362,10 +369,23 @@ struct TraceState
     UINT16 pc;
     UINT16 wp;
     UINT16 st;
-    UINT32 clocks;
+    UINT64 clocks;
     const char* mnemonic;
     const char* disasm;
+    std::array<UINT16, 16> registers;
 };
+
+static std::array<UINT16, 16> CaptureRegisters(UINT16 wp)
+{
+    std::array<UINT16, 16> registers{};
+    for (int i = 0; i < 16; i++)
+    {
+        UINT16 addr = static_cast<UINT16>((wp + i * 2) & 0xFFFE);
+        registers[i] = static_cast<UINT16>((Memory[addr] << 8) |
+                                           Memory[addr + 1]);
+    }
+    return registers;
+}
 
 //----------------------------------------------------------------------------
 // Output JSON trace line (all hex for values)
@@ -373,17 +393,15 @@ struct TraceState
 
 static void OutputTrace(FILE* out, const TraceState& t)
 {
-    fprintf(out, "{\"step\":%" PRIu64 ",\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%" PRIu32 ",",
+    fprintf(out, "{\"step\":%" PRIu64 ",\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%" PRIu64 ",",
             t.step, t.pc, t.wp, t.st, t.clocks);
     fprintf(out, "\"op\":\"%s\",\"asm\":\"%s\",\"r\":[", t.mnemonic, t.disasm);
 
-    // Output registers as hex strings (read directly, don't affect clock)
+    // Registers are captured before execution with the rest of the trace.
     for (int i = 0; i < 16; i++)
     {
-        UINT16 addr = (t.wp + i * 2) & 0xFFFE;
-        UINT16 reg = (Memory[addr] << 8) | Memory[addr + 1];
         if (i > 0) fprintf(out, ",");
-        fprintf(out, "\"%04X\"", reg);
+        fprintf(out, "\"%04X\"", t.registers[i]);
     }
 
     fprintf(out, "]}\n");
@@ -406,6 +424,12 @@ int main(int argc, char* argv[])
 {
     Config cfg;
 
+    enum
+    {
+        OPT_WAIT_STATES = 256,
+        OPT_NO_LOOP_DETECT
+    };
+
     static struct option longOpts[] = {
         {"load",           required_argument, nullptr, 'l'},
         {"entry",          required_argument, nullptr, 'e'},
@@ -414,6 +438,8 @@ int main(int argc, char* argv[])
         {"stop-at",        required_argument, nullptr, 's'},
         {"irq",            required_argument, nullptr, 'i'},
         {"timer",          required_argument, nullptr, 'R'},
+        {"wait-states",    required_argument, nullptr, OPT_WAIT_STATES},
+        {"no-loop-detect", no_argument,       nullptr, OPT_NO_LOOP_DETECT},
         {"output",         required_argument, nullptr, 'o'},
         {"dump",           required_argument, nullptr, 'd'},
         {"tracepoint",     required_argument, nullptr, 't'},
@@ -496,6 +522,22 @@ int main(int argc, char* argv[])
                 cfg.timers.push_back(timer);
                 break;
             }
+            case OPT_WAIT_STATES:
+            {
+                char* end = nullptr;
+                unsigned long value = strtoul(optarg, &end, 10);
+                if (*optarg == '\0' || *end != '\0' || value > UINT32_MAX)
+                {
+                    fprintf(stderr, "Error: Invalid wait-state count '%s'\n",
+                            optarg);
+                    return 1;
+                }
+                cfg.waitStates = static_cast<UINT32>(value);
+                break;
+            }
+            case OPT_NO_LOOP_DETECT:
+                cfg.loopDetect = false;
+                break;
             case 'o':
                 cfg.outputFile = optarg;
                 break;
@@ -609,11 +651,12 @@ int main(int argc, char* argv[])
     }
 
     // Set up initial state
-    WorkspacePtr = cfg.wpAddr;
-    ProgramCounter = cfg.entryAddr;
+    SetWorkspacePointer(cfg.wpAddr);
+    SetProgramCounter(cfg.entryAddr);
     Status = 0;
     ClockCycleCounter = 0;
     InstructionCounter = 0;
+    SetMemoryWaitStates(cfg.waitStates);
 
     // GDB mode: start RSP server instead of batch execution
     if (cfg.gdbPort > 0)
@@ -630,6 +673,8 @@ int main(int argc, char* argv[])
         fprintf(stderr, "  Entry:  0x%04X\n", cfg.entryAddr);
         fprintf(stderr, "  WP:     0x%04X\n", cfg.wpAddr);
         fprintf(stderr, "  Max:    %" PRIu64 " steps\n", cfg.maxSteps);
+        fprintf(stderr, "  Wait:   %" PRIu32 " state(s) per memory access\n",
+                cfg.waitStates);
         if (!cfg.stopAddrs.empty())
         {
             fprintf(stderr, "  Stop:");
@@ -679,19 +724,22 @@ int main(int argc, char* argv[])
 
     // Main trace loop
     char disasmBuf[80];
-    UINT64 step = 0;
-    bool halted = false;
-    UINT16 lastPC = 0xFFFF;
+    UINT16 lastInstructionPC = 0;
+    bool haveLastInstructionPC = false;
     size_t nextIRQ = 0;
     const char* haltReason = "max";
     UINT64 totalTracepointHits = 0;
 
-    while (step < cfg.maxSteps && !halted)
+    while (InstructionCounter < cfg.maxSteps)
     {
+        const UINT64 step = InstructionCounter;
+        bool interruptRequested = false;
+
         // Check for scheduled interrupts
         while (nextIRQ < cfg.irqs.size() && cfg.irqs[nextIRQ].atStep <= step)
         {
             TriggerInterrupt(cfg.irqs[nextIRQ].level);
+            interruptRequested = true;
             if (!cfg.quiet && !cfg.summary)
             {
                 fprintf(stderr, "[Step %" PRIu64 "] Triggered IRQ level %d\n",
@@ -703,92 +751,57 @@ int main(int argc, char* argv[])
         // Check for periodic timer interrupts
         for (auto& t : cfg.timers)
         {
-            if (ClockCycleCounter >= t.nextTriggerCycle)
+            while (ClockCycleCounter >= t.nextTriggerCycle)
             {
                 TriggerInterrupt(t.irqLevel);
                 t.nextTriggerCycle += t.periodCycles;
+                interruptRequested = true;
             }
+        }
+
+        // IDLE stops instruction execution but not the external clock. Advance
+        // directly to the next timer edge so a periodic interrupt can wake it.
+        if (IsHalted() && !interruptRequested && !cfg.timers.empty())
+        {
+            UINT64 nextTimerCycle = cfg.timers.front().nextTriggerCycle;
+            for (const auto& t : cfg.timers)
+            {
+                nextTimerCycle = std::min(nextTimerCycle,
+                                          t.nextTriggerCycle);
+            }
+            if (ClockCycleCounter < nextTimerCycle)
+            {
+                ClockCycleCounter = nextTimerCycle;
+            }
+            for (auto& t : cfg.timers)
+            {
+                while (ClockCycleCounter >= t.nextTriggerCycle)
+                {
+                    TriggerInterrupt(t.irqLevel);
+                    t.nextTriggerCycle += t.periodCycles;
+                    interruptRequested = true;
+                }
+            }
+        }
+
+        // A future instruction-count IRQ cannot wake IDLE because the count no
+        // longer advances. Only an interrupt requested at this boundary can.
+        if (IsHalted() && !interruptRequested)
+        {
+            haltReason = "idle";
+            break;
         }
 
         // Capture pre-state
         UINT16 pc = ProgramCounter;
         UINT16 wp = WorkspacePtr;
         UINT16 st = Status;
-        UINT32 clocks = ClockCycleCounter;
+        UINT64 clocks = ClockCycleCounter;
+        const auto registers = CaptureRegisters(wp);
 
-        // Disassemble early (needed for tracepoint output before stop checks)
-        DisassembleASM(pc, &Memory[pc], disasmBuf);
-
-        // Check tracepoints - output trace line immediately if hit
-        for (auto& tp : cfg.tracepoints)
-        {
-            if (pc == tp.pc)
-            {
-                tp.hits++;
-                totalTracepointHits++;
-
-                // Output tracepoint trace immediately (before stop checks)
-                const char* disasm = disasmBuf;
-                if (strlen(disasmBuf) > 5)
-                {
-                    disasm = disasmBuf + 5;  // Skip "XXXX "
-                }
-                // Extract mnemonic from disasm (first word)
-                static char mnemonicBuf[16];
-                const char* space = strchr(disasm, ' ');
-                if (space)
-                {
-                    size_t len = space - disasm;
-                    if (len >= sizeof(mnemonicBuf)) len = sizeof(mnemonicBuf) - 1;
-                    strncpy(mnemonicBuf, disasm, len);
-                    mnemonicBuf[len] = '\0';
-                }
-                else
-                {
-                    strncpy(mnemonicBuf, disasm, sizeof(mnemonicBuf) - 1);
-                    mnemonicBuf[sizeof(mnemonicBuf) - 1] = '\0';
-                }
-
-                TraceState trace = { step, pc, wp, st, clocks, mnemonicBuf, disasm };
-                OutputTrace(out, trace);
-                break;  // Only match one tracepoint per PC
-            }
-        }
-
-        // Check tracepoint-max
-        if (cfg.tracepointMax > 0 && totalTracepointHits >= cfg.tracepointMax)
-        {
-            if (!cfg.quiet)
-            {
-                fprintf(stderr, "Tracepoint max hit (%" PRIu64 " total hits)\n",
-                        totalTracepointHits);
-            }
-            haltReason = "tracepoint-max";
-            break;
-        }
-
-        // Check tracepoint-stop (all tracepoints hit at least once)
-        if (cfg.tracepointStop && !cfg.tracepoints.empty())
-        {
-            bool allHit = true;
-            for (const auto& tp : cfg.tracepoints)
-            {
-                if (tp.hits == 0)
-                {
-                    allHit = false;
-                    break;
-                }
-            }
-            if (allHit)
-            {
-                if (!cfg.quiet)
-                {
-                    fprintf(stderr, "All tracepoints hit at least once\n");
-                }
-                haltReason = "tracepoint-stop";
-                break;
-            }
-        }
+        // Disassemble the candidate instruction. If StepCPU reports interrupt
+        // entry, this snapshot is discarded and never emitted as a trace.
+        DisassembleASM(pc, disasmBuf, sizeof(disasmBuf));
 
         // Check stop address
         if (!cfg.stopAddrs.empty() && IsStopAddress(pc, cfg.stopAddrs))
@@ -801,9 +814,91 @@ int main(int argc, char* argv[])
             break;
         }
 
-        // Check for infinite loop (JMP $)
-        // Skip when periodic timers are active - idle loops are legitimate
-        if (pc == lastPC && cfg.timers.empty())
+        const CPUStepResult result = StepCPU();
+        if (result.event == CPUEvent::Interrupt)
+        {
+            continue;
+        }
+        if (result.event == CPUEvent::Idle)
+        {
+            haltReason = "idle";
+            break;
+        }
+
+        // Emit tracepoints only for instructions that actually executed.
+        for (auto& tp : cfg.tracepoints)
+        {
+            if (pc != tp.pc)
+            {
+                continue;
+            }
+
+            tp.hits++;
+            totalTracepointHits++;
+
+            const char* disasm = strlen(disasmBuf) > 5
+                                     ? disasmBuf + 5
+                                     : disasmBuf;
+            const char* mnemonic = result.opcode
+                                       ? result.opcode->mnemonic
+                                       : "???";
+            TraceState trace = { step, pc, wp, st, clocks, mnemonic,
+                                 disasm, registers };
+            OutputTrace(out, trace);
+            break;
+        }
+
+        // Output trace in normal mode.
+        if (!cfg.summary)
+        {
+            const char* mnemonic = result.opcode
+                                       ? result.opcode->mnemonic
+                                       : "???";
+
+            // Skip the "XXXX " prefix from disassembly for cleaner output
+            const char* disasm = strlen(disasmBuf) > 5
+                                     ? disasmBuf + 5
+                                     : disasmBuf;
+
+            TraceState trace = { step, pc, wp, st, clocks, mnemonic,
+                                 disasm, registers };
+            OutputTrace(out, trace);
+        }
+
+        if (cfg.tracepointMax > 0 &&
+            totalTracepointHits >= cfg.tracepointMax)
+        {
+            if (!cfg.quiet)
+            {
+                fprintf(stderr, "Tracepoint max hit (%" PRIu64
+                                " total hits)\n", totalTracepointHits);
+            }
+            haltReason = "tracepoint-max";
+            break;
+        }
+
+        if (cfg.tracepointStop && !cfg.tracepoints.empty())
+        {
+            const bool allHit = std::all_of(
+                cfg.tracepoints.begin(), cfg.tracepoints.end(),
+                [](const Tracepoint& tp) { return tp.hits != 0; });
+            if (allHit)
+            {
+                if (!cfg.quiet)
+                {
+                    fprintf(stderr, "All tracepoints hit at least once\n");
+                }
+                haltReason = "tracepoint-stop";
+                break;
+            }
+        }
+
+        // A repeated executed PC is a true self-loop. Keep running when a
+        // timer or future scheduled interrupt can still alter control flow.
+        const bool canReceiveFutureInterrupt =
+            !cfg.timers.empty() || nextIRQ < cfg.irqs.size();
+        if (cfg.loopDetect && haveLastInstructionPC &&
+            pc == lastInstructionPC && !canReceiveFutureInterrupt)
         {
             if (!cfg.quiet && !cfg.summary)
             {
@@ -812,48 +907,23 @@ int main(int argc, char* argv[])
             haltReason = "loop";
             break;
         }
-        lastPC = pc;
-
-        // Execute
-        halted = StepCPU();
-        if (halted)
-        {
-            haltReason = "idle";
-        }
-
-        // Output trace in normal mode (tracepoint trace already output above)
-        if (!cfg.summary)
-        {
-            sOpCode* op = GetLastOpcode();
-            const char* mnemonic = op ? op->mnemonic : "???";
-
-            // Skip the "XXXX " prefix from disassembly for cleaner output
-            const char* disasm = disasmBuf;
-            if (strlen(disasmBuf) > 5)
-            {
-                disasm = disasmBuf + 5;  // Skip "XXXX "
-            }
-
-            TraceState trace = { step, pc, wp, st, clocks, mnemonic, disasm };
-            OutputTrace(out, trace);
-        }
-
-        step++;
+        lastInstructionPC = pc;
+        haveLastInstructionPC = true;
     }
 
     // Final stats (human-readable)
     if (!cfg.quiet && !cfg.summary)
     {
         fprintf(stderr, "\nExecution complete:\n");
-        fprintf(stderr, "  Instructions: %" PRIu64 "\n", step);
-        fprintf(stderr, "  Clocks:       %u (rough estimate)\n", ClockCycleCounter);
+        fprintf(stderr, "  Instructions: %" PRIu64 "\n", InstructionCounter);
+        fprintf(stderr, "  Clocks:       %" PRIu64 "\n", ClockCycleCounter);
         fprintf(stderr, "  Final PC:     0x%04X\n", ProgramCounter);
         fprintf(stderr, "  Final ST:     0x%04X\n", Status);
-        if (halted)
+        if (IsHalted())
         {
             fprintf(stderr, "  Status:       HALTED (IDLE instruction)\n");
         }
-        else if (step >= cfg.maxSteps)
+        else if (InstructionCounter >= cfg.maxSteps)
         {
             fprintf(stderr, "  Status:       MAX STEPS REACHED\n");
         }
@@ -862,9 +932,9 @@ int main(int argc, char* argv[])
     // Summary JSON output
     if (cfg.summary)
     {
-        fprintf(out, "{\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%" PRIu32 ",\"steps\":%" PRIu64 ",\"halt\":\"%s\",\"r\":[",
+        fprintf(out, "{\"pc\":\"%04X\",\"wp\":\"%04X\",\"st\":\"%04X\",\"clk\":%" PRIu64 ",\"steps\":%" PRIu64 ",\"halt\":\"%s\",\"r\":[",
                 ProgramCounter, WorkspacePtr, Status, ClockCycleCounter,
-                step, haltReason);
+                InstructionCounter, haltReason);
         for (int i = 0; i < 16; i++)
         {
             UINT16 addr = (WorkspacePtr + i * 2) & 0xFFFE;
@@ -878,26 +948,29 @@ int main(int argc, char* argv[])
     // Memory dumps
     for (const auto& dump : cfg.dumps)
     {
-        fprintf(stderr, "\nMemory dump 0x%04X - 0x%04X (%u bytes):\n",
-                dump.start, dump.start + dump.length - 1, dump.length);
+        const UINT32 end = static_cast<UINT32>(dump.start) +
+                           dump.length - 1;
+        fprintf(stderr, "\nMemory dump 0x%04X - 0x%04X (%" PRIu32
+                        " bytes):\n", dump.start, end, dump.length);
 
-        for (UINT16 offset = 0; offset < dump.length; offset += 16)
+        for (UINT32 offset = 0; offset < dump.length; offset += 16)
         {
-            fprintf(stderr, "  %04X:", dump.start + offset);
+            const UINT32 lineAddress = static_cast<UINT32>(dump.start) +
+                                       offset;
+            fprintf(stderr, "  %04X:", lineAddress);
 
-            // Hex words
-            for (UINT16 i = 0; i < 16 && offset + i < dump.length; i += 2)
+            // Hex bytes avoid an aligned word read beyond an odd-length dump.
+            for (UINT32 i = 0; i < 16 && offset + i < dump.length; i++)
             {
-                UINT16 addr = dump.start + offset + i;
-                UINT16 word = ReadWord(addr);
-                fprintf(stderr, " %04X", word);
+                const UINT32 addr = lineAddress + i;
+                fprintf(stderr, " %02X", Memory[addr]);
             }
 
             // ASCII representation
             fprintf(stderr, "  |");
-            for (UINT16 i = 0; i < 16 && offset + i < dump.length; i++)
+            for (UINT32 i = 0; i < 16 && offset + i < dump.length; i++)
             {
-                UINT8 byte = Memory[dump.start + offset + i];
+                UINT8 byte = Memory[lineAddress + i];
                 fprintf(stderr, "%c", (byte >= 32 && byte < 127) ? byte : '.');
             }
             fprintf(stderr, "|\n");

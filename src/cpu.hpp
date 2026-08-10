@@ -25,6 +25,7 @@ struct sOpCode
     UINT16      format;
     void      (*function)();
     UINT32      clocks;
+    UINT32      memoryAccesses;
 };
 
 //----------------------------------------------------------------------------
@@ -34,8 +35,8 @@ struct sOpCode
 extern UINT16 WorkspacePtr;      // WP - Workspace Pointer
 extern UINT16 ProgramCounter;    // PC - Program Counter
 extern UINT16 Status;            // ST - Status Register
-extern UINT32 ClockCycleCounter; // Clock cycles
-extern UINT32 InstructionCounter;// Instructions executed
+extern UINT64 ClockCycleCounter; // Clock cycles
+extern UINT64 InstructionCounter;// Instructions executed
 
 //----------------------------------------------------------------------------
 // Memory (64K flat)
@@ -43,7 +44,7 @@ extern UINT32 InstructionCounter;// Instructions executed
 
 extern UINT8 Memory[0x10000];
 
-// Memory access functions
+// Timing-neutral memory inspection functions
 UINT8  ReadByte(UINT16 address);
 UINT16 ReadWord(UINT16 address);
 void   WriteByte(UINT16 address, UINT8 value);
@@ -53,14 +54,40 @@ void   WriteWord(UINT16 address, UINT16 value);
 // CPU Control
 //----------------------------------------------------------------------------
 
+enum class CPUEvent
+{
+    Instruction,
+    Interrupt,
+    Idle
+};
+
+struct CPUStepResult
+{
+    CPUEvent event;
+    bool halted;
+    sOpCode* opcode;
+};
+
 // Initialize the CPU (call once at startup)
 void InitCPU();
 
-// Reset the CPU state
+// Clear the flat 64K memory image.
+void ClearMemory();
+
+// Reset CPU state without altering memory.
 void ResetCPU();
 
-// Execute one instruction, returns true if CPU halted (IDLE)
-bool StepCPU();
+// Architectural PC and WP are always word-aligned.
+void SetProgramCounter(UINT16 address);
+void SetWorkspacePointer(UINT16 address);
+
+// Add this many wait-state clocks to every modeled memory access.
+void SetMemoryWaitStates(UINT32 waitStates);
+UINT32 GetMemoryWaitStates();
+
+// Advance to the next CPU event. Interrupt entry is reported separately and
+// does not increment InstructionCounter.
+CPUStepResult StepCPU();
 
 // Check if CPU is halted (IDLE with no pending interrupt)
 bool IsHalted();
@@ -75,9 +102,6 @@ sOpCode* GetLastOpcode();
 
 // Lookup opcode by value
 sOpCode* LookupOpCode(UINT16 opcode);
-
-// Disassemble instruction at address, returns next address
-UINT16 Disassemble(UINT16 address, char* buffer, size_t bufferSize);
 
 //----------------------------------------------------------------------------
 // Register access helpers

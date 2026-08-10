@@ -7,23 +7,22 @@
 // Supports: register read/write, memory read/write, breakpoints,
 // single-step, continue, target description XML.
 //
-// Register model (19 registers, all 16-bit big-endian):
-//   0-15: R0-R15 (workspace registers, read from Memory[WP+reg*2])
-//   16:   PC (Program Counter)
-//   17:   WP (Workspace Pointer)
-//   18:   ST (Status Register)
-//
-// Uses GDB Target Description XML (tdesc) to define registers without
-// requiring a known architecture. GDB accepts the register layout
-// from the stub and uses it for register display and DWARF mapping.
+// This is a machine-level compatibility shim. Stock GDB has no TMS9900
+// architecture, so the stub exposes an MSP430-shaped register packet for
+// register inspection, memory access, stepping, and breakpoints. It does not
+// provide correct TMS9900 disassembly or compiler-DWARF register mapping.
 //----------------------------------------------------------------------------
 
 #include "gdb_stub.hpp"
 #include "cpu.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <set>
 #include <signal.h>
@@ -41,8 +40,6 @@
 // GDB requires a known <architecture> to accept any target description.
 // We use "msp430" (another TI 16-bit CPU) as the architecture hint --
 // this just tells GDB to use 16-bit register handling internally.
-// The register names, layout, and DWARF numbering are pure TMS9900.
-//
 // MSP430's required feature "org.gnu.gdb.msp430.core" expects r0-r15
 // as 32-bit values.  We map them as:
 //   r0  (pc)  = TMS9900 PC      r1 (sp) = TMS9900 WP
@@ -103,23 +100,110 @@ static void hex_reg(char* buf, UINT16 val)
     hex_byte(buf + 6, 0);
 }
 
-static unsigned long parse_hex(const char* s, const char** endp)
+static bool parse_hex_range(const char* begin, const char* end,
+                            unsigned long& value)
 {
-    unsigned long val = 0;
-    while (*s)
+    if (begin == end)
     {
-        int d = hex_val(*s);
-        if (d < 0) break;
-        val = (val << 4) | d;
-        s++;
+        return false;
     }
-    if (endp) *endp = s;
-    return val;
+
+    value = 0;
+    for (const char* current = begin; current != end; ++current)
+    {
+        const int digit = hex_val(*current);
+        if (digit < 0 ||
+            value > (std::numeric_limits<unsigned long>::max() - digit) / 16)
+        {
+            return false;
+        }
+        value = value * 16 + static_cast<unsigned long>(digit);
+    }
+    return true;
+}
+
+static bool parse_register_value(const char* data, size_t length,
+                                 UINT16& value)
+{
+    if (length != 8)
+    {
+        return false;
+    }
+    for (size_t i = 0; i < length; ++i)
+    {
+        if (hex_val(data[i]) < 0)
+        {
+            return false;
+        }
+    }
+
+    const UINT8 low = static_cast<UINT8>((hex_val(data[0]) << 4) |
+                                         hex_val(data[1]));
+    const UINT8 high = static_cast<UINT8>((hex_val(data[2]) << 4) |
+                                          hex_val(data[3]));
+    value = static_cast<UINT16>((high << 8) | low);
+    return true;
+}
+
+static bool set_optional_program_counter(const std::string& packet)
+{
+    if (packet.size() == 1)
+    {
+        return true;
+    }
+
+    unsigned long address = 0;
+    if (!parse_hex_range(packet.data() + 1,
+                         packet.data() + packet.size(), address) ||
+        address > 0xFFFF)
+    {
+        return false;
+    }
+    SetProgramCounter(static_cast<UINT16>(address));
+    return true;
 }
 
 //----------------------------------------------------------------------------
 // RSP packet I/O
 //----------------------------------------------------------------------------
+
+static constexpr size_t MaxPacketSize = 4096;
+
+static bool write_all(int fd, const char* data, size_t size)
+{
+    while (size != 0)
+    {
+        const ssize_t written = write(fd, data, size);
+        if (written < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (written <= 0)
+        {
+            return false;
+        }
+        data += written;
+        size -= static_cast<size_t>(written);
+    }
+    return true;
+}
+
+static bool read_byte(int fd, char& value)
+{
+    for (;;)
+    {
+        const ssize_t count = read(fd, &value, 1);
+        if (count == 1)
+        {
+            return true;
+        }
+        if (count < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        return false;
+    }
+}
 
 static bool send_packet(int fd, const std::string& data)
 {
@@ -127,56 +211,116 @@ static bool send_packet(int fd, const std::string& data)
     for (char c : data)
         cksum += (UINT8)c;
 
-    char hdr = '$';
-    char trailer[3];
-    trailer[0] = '#';
-    hex_byte(trailer + 1, cksum);
+    std::string packet;
+    packet.reserve(data.size() + 4);
+    packet.push_back('$');
+    packet += data;
+    packet.push_back('#');
+    packet.push_back(hexchars[(cksum >> 4) & 0x0F]);
+    packet.push_back(hexchars[cksum & 0x0F]);
 
-    if (write(fd, &hdr, 1) != 1) return false;
-    if (!data.empty())
-    {
-        ssize_t n = write(fd, data.c_str(), data.size());
-        if (n != (ssize_t)data.size()) return false;
-    }
-    if (write(fd, trailer, 3) != 3) return false;
-
-    // Wait for ACK
-    char ack;
-    if (read(fd, &ack, 1) != 1) return false;
-    return (ack == '+');
-}
-
-static std::string recv_packet(int fd)
-{
-    char c;
     for (;;)
     {
-        if (read(fd, &c, 1) != 1) return "";
-        if (c == '$') break;
-        if (c == 0x03)
+        if (!write_all(fd, packet.data(), packet.size()))
         {
-            // Ctrl-C async break
-            return "\x03";
+            return false;
+        }
+
+        char ack;
+        if (!read_byte(fd, ack))
+        {
+            return false;
+        }
+        if (ack == '+')
+        {
+            return true;
+        }
+        if (ack != '-')
+        {
+            return false;
         }
     }
+}
 
+enum class ReceiveStatus
+{
+    Packet,
+    Break,
+    Disconnected
+};
+
+struct ReceivedPacket
+{
+    ReceiveStatus status;
     std::string data;
+};
+
+static ReceivedPacket recv_packet(int fd)
+{
     for (;;)
     {
-        if (read(fd, &c, 1) != 1) return "";
-        if (c == '#') break;
-        data += c;
+        char c;
+        do
+        {
+            if (!read_byte(fd, c))
+            {
+                return { ReceiveStatus::Disconnected, {} };
+            }
+            if (c == 0x03)
+            {
+                return { ReceiveStatus::Break, {} };
+            }
+        }
+        while (c != '$');
+
+        std::string data;
+        UINT8 actualChecksum = 0;
+        bool oversized = false;
+        for (;;)
+        {
+            if (!read_byte(fd, c))
+            {
+                return { ReceiveStatus::Disconnected, {} };
+            }
+            if (c == '#')
+            {
+                break;
+            }
+            actualChecksum = static_cast<UINT8>(actualChecksum +
+                                                static_cast<UINT8>(c));
+            if (data.size() < MaxPacketSize)
+            {
+                data.push_back(c);
+            }
+            else
+            {
+                oversized = true;
+            }
+        }
+
+        char checksumHigh;
+        char checksumLow;
+        if (!read_byte(fd, checksumHigh) || !read_byte(fd, checksumLow))
+        {
+            return { ReceiveStatus::Disconnected, {} };
+        }
+        const int high = hex_val(checksumHigh);
+        const int low = hex_val(checksumLow);
+        const bool valid = !oversized && high >= 0 && low >= 0 &&
+                           actualChecksum == ((high << 4) | low);
+
+        const char ack = valid ? '+' : '-';
+        if (!write_all(fd, &ack, 1))
+        {
+            return { ReceiveStatus::Disconnected, {} };
+        }
+        if (valid)
+        {
+            return { ReceiveStatus::Packet, std::move(data) };
+        }
+
+        // Invalid packets are NACKed and discarded; wait for retransmission.
     }
-
-    // Consume 2-char checksum (we trust it)
-    char ckbuf[2];
-    if (read(fd, ckbuf, 2) != 2) return "";
-
-    // Send ACK
-    char ack = '+';
-    (void)write(fd, &ack, 1);
-
-    return data;
 }
 
 //----------------------------------------------------------------------------
@@ -191,6 +335,37 @@ static void fire_timers(std::vector<PeriodicTimer>& timers)
         {
             TriggerInterrupt(t.irqLevel);
             t.nextTriggerCycle += t.periodCycles;
+        }
+    }
+}
+
+static void advance_idle_to_timer(std::vector<PeriodicTimer>& timers)
+{
+    if (!IsHalted() || timers.empty()) return;
+
+    UINT64 nextCycle = timers.front().nextTriggerCycle;
+    for (const auto& timer : timers)
+    {
+        nextCycle = std::min(nextCycle, timer.nextTriggerCycle);
+    }
+    if (ClockCycleCounter < nextCycle)
+    {
+        ClockCycleCounter = nextCycle;
+    }
+    fire_timers(timers);
+}
+
+static CPUStepResult step_instruction(std::vector<PeriodicTimer>& timers)
+{
+    for (;;)
+    {
+        fire_timers(timers);
+        advance_idle_to_timer(timers);
+        const CPUStepResult result = StepCPU();
+        fire_timers(timers);
+        if (result.event != CPUEvent::Interrupt)
+        {
+            return result;
         }
     }
 }
@@ -228,8 +403,8 @@ static UINT16 read_reg(int regnum)
 
 static void write_reg(int regnum, UINT16 val)
 {
-    if (regnum == 0) ProgramCounter = val;
-    else if (regnum == 1) WorkspacePtr = val;
+    if (regnum == 0) SetProgramCounter(val);
+    else if (regnum == 1) SetWorkspacePointer(val);
     else if (regnum == 2) Status = val;
     else if (regnum >= 3 && regnum <= 15)
     {
@@ -297,19 +472,24 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
 
     while (running)
     {
-        std::string pkt = recv_packet(clientFd);
-        if (pkt.empty())
+        ReceivedPacket received = recv_packet(clientFd);
+        if (received.status == ReceiveStatus::Disconnected)
         {
             fprintf(stderr, "GDB disconnected.\n");
             break;
         }
+        std::string& pkt = received.data;
 
         std::string reply;
 
         //--- Async break (Ctrl-C) ---
-        if (pkt[0] == 0x03)
+        if (received.status == ReceiveStatus::Break)
         {
             reply = "S05";
+        }
+        else if (pkt.empty())
+        {
+            reply = "";
         }
         //--- Halt reason ---
         else if (pkt[0] == '?')
@@ -328,29 +508,37 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         //--- Write all registers ---
         else if (pkt[0] == 'G')
         {
-            const char* p = pkt.c_str() + 1;
-            for (int i = 0; i < NUM_REGS; i++)
+            std::array<UINT16, NUM_REGS> values{};
+            bool valid = pkt.size() == 1 + NUM_REGS * 8;
+            for (int i = 0; valid && i < NUM_REGS; i++)
             {
-                // 8 hex chars per reg (32-bit LE), we use low 16 bits
-                if (!p[0] || !p[1] || !p[2] || !p[3]) break;
-                int h0 = hex_val(p[0]), h1 = hex_val(p[1]);
-                int h2 = hex_val(p[2]), h3 = hex_val(p[3]);
-                if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) break;
-                UINT8 lo = (h0 << 4) | h1;
-                UINT8 hi = (h2 << 4) | h3;
-                write_reg(i, (hi << 8) | lo);
-                p += 8;  // Skip full 32-bit value (ignore upper 16 bits)
+                valid = parse_register_value(pkt.data() + 1 + i * 8, 8,
+                                             values[i]);
             }
-            reply = "OK";
+            if (valid)
+            {
+                for (int i = 0; i < NUM_REGS; i++)
+                {
+                    write_reg(i, values[i]);
+                }
+                reply = "OK";
+            }
+            else
+            {
+                reply = "E01";
+            }
         }
         //--- Read single register ---
         else if (pkt[0] == 'p')
         {
-            int regnum = (int)parse_hex(pkt.c_str() + 1, nullptr);
-            if (regnum >= 0 && regnum < NUM_REGS)
+            unsigned long parsedReg = 0;
+            const bool valid = parse_hex_range(pkt.data() + 1,
+                                               pkt.data() + pkt.size(),
+                                               parsedReg);
+            if (valid && parsedReg < NUM_REGS)
             {
                 char buf[9];
-                hex_reg(buf, read_reg(regnum));
+                hex_reg(buf, read_reg(static_cast<int>(parsedReg)));
                 buf[8] = '\0';
                 reply = buf;
             }
@@ -363,45 +551,43 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         else if (pkt[0] == 'P')
         {
             const char* eq = strchr(pkt.c_str(), '=');
-            if (eq)
+            unsigned long parsedReg = 0;
+            UINT16 value = 0;
+            const bool valid = eq != nullptr && eq > pkt.data() + 1 &&
+                parse_hex_range(pkt.data() + 1, eq, parsedReg) &&
+                parsedReg < NUM_REGS &&
+                parse_register_value(eq + 1,
+                                     pkt.data() + pkt.size() - (eq + 1),
+                                     value);
+            if (valid)
             {
-                int regnum = (int)parse_hex(pkt.c_str() + 1, nullptr);
-                // 32-bit LE: parse first 4 hex chars (low 16 bits)
-                const char* vp = eq + 1;
-                int h0 = hex_val(vp[0]), h1 = hex_val(vp[1]);
-                int h2 = hex_val(vp[2]), h3 = hex_val(vp[3]);
-                UINT8 lo = (h0 >= 0 && h1 >= 0) ? ((h0 << 4) | h1) : 0;
-                UINT8 hi = (h2 >= 0 && h3 >= 0) ? ((h2 << 4) | h3) : 0;
-                UINT16 val = (hi << 8) | lo;
-                if (regnum >= 0 && regnum < NUM_REGS)
-                {
-                    write_reg(regnum, val);
-                    reply = "OK";
-                }
-                else
-                {
-                    reply = "E00";
-                }
+                write_reg(static_cast<int>(parsedReg), value);
+                reply = "OK";
             }
             else
             {
-                reply = "E00";
+                reply = "E01";
             }
         }
         //--- Read memory ---
         else if (pkt[0] == 'm')
         {
             const char* comma = strchr(pkt.c_str(), ',');
-            if (comma)
+            unsigned long address = 0;
+            unsigned long length = 0;
+            const bool valid = comma != nullptr && comma > pkt.data() + 1 &&
+                parse_hex_range(pkt.data() + 1, comma, address) &&
+                parse_hex_range(comma + 1, pkt.data() + pkt.size(), length) &&
+                address <= 0xFFFF && length <= MaxPacketSize / 2 &&
+                address + length <= 0x10000;
+            if (valid)
             {
-                UINT16 maddr = (UINT16)parse_hex(pkt.c_str() + 1, nullptr);
-                unsigned long len = parse_hex(comma + 1, nullptr);
                 std::string hex;
-                hex.reserve(len * 2);
+                hex.reserve(length * 2);
                 char hb[2];
-                for (unsigned long i = 0; i < len; i++)
+                for (unsigned long i = 0; i < length; i++)
                 {
-                    hex_byte(hb, Memory[(maddr + i) & 0xFFFF]);
+                    hex_byte(hb, Memory[address + i]);
                     hex += hb[0];
                     hex += hb[1];
                 }
@@ -409,7 +595,7 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
             }
             else
             {
-                reply = "E00";
+                reply = "E01";
             }
         }
         //--- Write memory ---
@@ -417,86 +603,109 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         {
             const char* comma = strchr(pkt.c_str(), ',');
             const char* colon = strchr(pkt.c_str(), ':');
-            if (comma && colon)
+            unsigned long address = 0;
+            unsigned long length = 0;
+            bool valid = comma != nullptr && colon != nullptr &&
+                comma > pkt.data() + 1 && comma < colon &&
+                parse_hex_range(pkt.data() + 1, comma, address) &&
+                parse_hex_range(comma + 1, colon, length) &&
+                address <= 0xFFFF && length <= 0x10000 &&
+                address + length <= 0x10000 &&
+                static_cast<size_t>(pkt.data() + pkt.size() - (colon + 1)) ==
+                    length * 2;
+            std::vector<UINT8> bytes;
+            if (valid)
             {
-                UINT16 maddr = (UINT16)parse_hex(pkt.c_str() + 1, nullptr);
-                unsigned long len = parse_hex(comma + 1, nullptr);
+                bytes.reserve(length);
                 const char* hexdata = colon + 1;
-                for (unsigned long i = 0; i < len && hexdata[0] && hexdata[1]; i++)
+                for (unsigned long i = 0; i < length; i++)
                 {
-                    int h0 = hex_val(hexdata[0]);
-                    int h1 = hex_val(hexdata[1]);
-                    if (h0 < 0 || h1 < 0) break;
-                    Memory[(maddr + i) & 0xFFFF] = (h0 << 4) | h1;
+                    const int high = hex_val(hexdata[0]);
+                    const int low = hex_val(hexdata[1]);
+                    if (high < 0 || low < 0)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    bytes.push_back(static_cast<UINT8>((high << 4) | low));
                     hexdata += 2;
+                }
+            }
+            if (valid)
+            {
+                for (unsigned long i = 0; i < length; i++)
+                {
+                    Memory[address + i] = bytes[i];
                 }
                 reply = "OK";
             }
             else
             {
-                reply = "E00";
+                reply = "E01";
             }
         }
         //--- Single step ---
         else if (pkt[0] == 's')
         {
-            if (pkt.size() > 1)
-                ProgramCounter = (UINT16)parse_hex(pkt.c_str() + 1, nullptr);
-
-            fire_timers(timers);
-            UINT32 prevInstr = InstructionCounter;
-            bool idle = false;
-            do {
-                idle = StepCPU();
-                fire_timers(timers);
-            } while (InstructionCounter == prevInstr && !idle);
-
-            reply = "S05";
+            if (!set_optional_program_counter(pkt))
+            {
+                reply = "E01";
+            }
+            else
+            {
+                step_instruction(timers);
+                reply = "S05";
+            }
         }
         //--- Continue ---
         else if (pkt[0] == 'c')
         {
-            if (pkt.size() > 1)
-                ProgramCounter = (UINT16)parse_hex(pkt.c_str() + 1, nullptr);
-
-            // Step once past current PC if it's a breakpoint
-            if (breakpoints.count(ProgramCounter))
+            if (!set_optional_program_counter(pkt))
             {
-                fire_timers(timers);
-                StepCPU();
+                reply = "E01";
             }
-
-            int pollCounter = 0;
-            for (;;)
+            else
             {
-                fire_timers(timers);
-                bool idle = StepCPU();
-
+                // Step once past current PC if it's a breakpoint.
                 if (breakpoints.count(ProgramCounter))
                 {
-                    reply = "S05";
-                    break;
+                    step_instruction(timers);
                 }
 
-                if (idle && timers.empty())
+                int pollCounter = 0;
+                for (;;)
                 {
-                    reply = "S05";
-                    break;
-                }
+                    fire_timers(timers);
+                    advance_idle_to_timer(timers);
+                    const CPUStepResult result = StepCPU();
 
-                if (++pollCounter >= 1024)
-                {
-                    pollCounter = 0;
-                    struct pollfd pfd;
-                    pfd.fd = clientFd;
-                    pfd.events = POLLIN;
-                    if (poll(&pfd, 1, 0) > 0)
+                    if (breakpoints.count(ProgramCounter))
                     {
-                        char brk;
-                        if (read(clientFd, &brk, 1) == 1 && brk == 0x03)
+                        reply = "S05";
+                        break;
+                    }
+
+                    if (result.event == CPUEvent::Idle ||
+                        (result.halted && timers.empty()))
+                    {
+                        reply = "S05";
+                        break;
+                    }
+
+                    if (++pollCounter >= 1024)
+                    {
+                        pollCounter = 0;
+                        struct pollfd pfd;
+                        pfd.fd = clientFd;
+                        pfd.events = POLLIN;
+                        if (poll(&pfd, 1, 0) > 0)
                         {
-                            reply = "S02";
-                            break;
+                            char brk;
+                            if (read(clientFd, &brk, 1) == 1 && brk == 0x03)
+                            {
+                                reply = "S02";
+                                break;
+                            }
                         }
                     }
                 }
@@ -506,12 +715,28 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         else if ((pkt[0] == 'Z' || pkt[0] == 'z') &&
                  pkt.size() >= 3 && pkt[1] == '0' && pkt[2] == ',')
         {
-            UINT16 bpAddr = (UINT16)parse_hex(pkt.c_str() + 3, nullptr);
-            if (pkt[0] == 'Z')
-                breakpoints.insert(bpAddr);
+            const char* secondComma = strchr(pkt.c_str() + 3, ',');
+            unsigned long address = 0;
+            unsigned long kind = 0;
+            const bool valid = secondComma != nullptr &&
+                parse_hex_range(pkt.data() + 3, secondComma, address) &&
+                parse_hex_range(secondComma + 1,
+                                pkt.data() + pkt.size(), kind) &&
+                address <= 0xFFFF;
+            if (!valid)
+            {
+                reply = "E01";
+            }
+            else if (pkt[0] == 'Z')
+            {
+                breakpoints.insert(static_cast<UINT16>(address & 0xFFFE));
+                reply = "OK";
+            }
             else
-                breakpoints.erase(bpAddr);
-            reply = "OK";
+            {
+                breakpoints.erase(static_cast<UINT16>(address & 0xFFFE));
+                reply = "OK";
+            }
         }
         //--- qSupported ---
         else if (pkt.compare(0, 10, "qSupported") == 0)
@@ -523,10 +748,13 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         {
             const char* args = pkt.c_str() + 31;
             const char* comma = strchr(args, ',');
-            if (comma)
+            unsigned long offset = 0;
+            unsigned long length = 0;
+            const bool valid = comma != nullptr && comma > args &&
+                parse_hex_range(args, comma, offset) &&
+                parse_hex_range(comma + 1, pkt.data() + pkt.size(), length);
+            if (valid)
             {
-                unsigned long offset = parse_hex(args, nullptr);
-                unsigned long length = parse_hex(comma + 1, nullptr);
                 size_t xmlLen = strlen(targetXML);
 
                 if (offset >= xmlLen)
@@ -536,7 +764,9 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
                 else
                 {
                     size_t remaining = xmlLen - offset;
-                    size_t chunk = remaining < length ? remaining : length;
+                    size_t requested = std::min<size_t>(length,
+                                                        MaxPacketSize - 1);
+                    size_t chunk = std::min(remaining, requested);
                     bool last = (offset + chunk >= xmlLen);
                     reply = last ? "l" : "m";
                     reply += std::string(targetXML + offset, chunk);
@@ -580,7 +810,7 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
         else if (pkt[0] == 'D')
         {
             fprintf(stderr, "GDB detached.\n");
-            send_packet(clientFd, "OK");
+            (void)send_packet(clientFd, "OK");
             close(clientFd);
             return 0;
         }
@@ -590,7 +820,11 @@ int gdb_main(int port, std::vector<PeriodicTimer>& timers)
             reply = "";
         }
 
-        send_packet(clientFd, reply);
+        if (!send_packet(clientFd, reply))
+        {
+            fprintf(stderr, "GDB disconnected while sending reply.\n");
+            break;
+        }
     }
 
     close(clientFd);

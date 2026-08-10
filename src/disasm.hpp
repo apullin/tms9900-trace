@@ -13,9 +13,10 @@
 
 #include "types.hpp"
 
-// Disassemble instruction at address
-// Returns the address of the next instruction
-// Buffer should be at least 40 bytes
-UINT16 DisassembleASM(UINT16 address, const UINT8* memory, char* buffer);
+#include <cstddef>
+
+// Disassemble one instruction from the simulator's flat memory. Reads wrap at
+// the 16-bit address boundary. Returns the next instruction address.
+UINT16 DisassembleASM(UINT16 address, char* buffer, size_t bufferSize);
 
 #endif // TMS9900_DISASM_HPP_
