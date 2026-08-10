@@ -34,6 +34,9 @@ Execution Options:
   -n, --max-steps=N     Max instructions (default: 1000000)
   -s, --stop-at=ADDR    Stop at address (hex, can repeat)
   --irq=LEVEL@STEP      Trigger interrupt at step (can repeat)
+  --timer=LEVEL:PERIOD  Periodic interrupt every PERIOD cycles (can repeat)
+  --wait-states=N       Add N clocks per modeled memory access
+  --no-loop-detect      Do not stop on a repeated instruction PC
 
 Output Options:
   -o, --output=FILE     Output file (default: stdout)
@@ -46,6 +49,9 @@ Tracepoint Options (require -S):
   -T, --tracepoint-file=FILE  Load tracepoint addresses from file
   --tracepoint-max=N          Stop after N total tracepoint hits
   --tracepoint-stop           Stop when all tracepoints hit at least once
+
+GDB Debugging:
+  --gdb=PORT            Start the machine-level GDB RSP compatibility server
 
 Other:
   -h, --help            Show help
@@ -64,10 +70,14 @@ Fields:
 - `pc`: Program counter before execution (hex)
 - `wp`: Workspace pointer before execution (hex)
 - `st`: Status register before execution (hex)
-- `clk`: Clock cycles (rough estimate, see below)
+- `clk`: Clock cycles before execution
 - `op`: Instruction mnemonic
 - `asm`: Full disassembly
-- `r`: Array of R0-R15 values (hex strings)
+- `r`: R0-R15 before execution (hex strings)
+
+Every field in an instruction record is captured before that instruction
+executes. Interrupt entry is an explicit CPU event and does not produce a fake
+instruction record or increment `step`.
 
 ## Examples
 
@@ -126,7 +136,7 @@ The `-S, --summary` option runs silently and outputs a single JSON line with fin
 
 Fields:
 - `pc`, `wp`, `st`: Final CPU registers (hex)
-- `clk`: Clock cycles (rough estimate)
+- `clk`: Clock cycles at exit
 - `steps`: Instructions executed
 - `halt`: Stop reason (`"idle"`, `"stop"`, `"loop"`, `"max"`, `"tracepoint-max"`, `"tracepoint-stop"`)
 - `r`: R0-R15 values (hex)
@@ -139,12 +149,14 @@ Tracepoints require `-S` mode. Without `-S`, all instructions are traced anyway.
 
 Example output with `-q -S --tracepoint 0x6000 --tracepoint 0x6100 --tracepoint-stop`:
 ```
-{"step":50,"pc":"6000","wp":"8300","st":"0000","clk":1000,"op":"LI","asm":"LI   R0,>0001","r":["0001",...]}
+{"step":50,"pc":"6000","wp":"8300","st":"0000","clk":1000,"op":"LI","asm":"LI   R0,>0001","r":["0000",...]}
 {"step":120,"pc":"6100","wp":"8300","st":"C000","clk":2500,"op":"RT","asm":"RT","r":["0005",...]}
 {"pc":"6100","wp":"8300","st":"C000","clk":2500,"steps":120,"halt":"tracepoint-stop","r":["0005",...]}
 ```
 
-Each tracepoint hit outputs a full trace line. The final line is the summary JSON. To measure function cycles, compute `clk` deltas between entry/exit trace lines.
+Each tracepoint hit outputs the same pre-instruction record used by unfiltered
+tracing. The final line is the summary JSON. To measure function cycles,
+compute `clk` deltas between entry/exit trace lines.
 
 ## Memory Dumps
 
@@ -152,11 +164,13 @@ The `-d, --dump=START:LEN` option dumps memory ranges at exit, useful for verify
 
 ```
 Memory dump 0x8100 - 0x811F (32 bytes):
-  8100: 0037 0056 008D 0000 0001 0002 0005 0008  |.7.V............|
-  8110: 0009 0000 0000 0000 0000 0000 0000 0000  |................|
+  8100: 00 37 00 56 00 8D 00 00 00 01 00 02 00 05 00 08  |.7.V............|
+  8110: 00 09 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
 ```
 
 Multiple dump ranges can be specified by repeating the `-d` option.
+Ranges must stay within the flat 64K address space. A complete
+`0x0000:65536` dump is valid; wrapping ranges are rejected.
 
 ## Interrupt Simulation
 
@@ -168,6 +182,11 @@ The interrupt is processed according to TMS9900 behavior:
 1. Interrupt recognized if level <= mask in ST bits 0-3
 2. Context switch: fetch WP/PC from vector (level * 4), save old state to R13/R14/R15
 3. New interrupt mask = level - 1 (except level 0 stays 0)
+
+RESET (level 0) clears ST before saving the new context and bypasses the
+one-instruction maskable-interrupt inhibition. BLWP, XOP, and interrupt entry
+inhibit maskable interrupt recognition until the first target instruction has
+executed.
 
 Vector addresses:
 - Level 0 (RESET): 0x0000
@@ -191,9 +210,22 @@ The simulator stops when:
 5. Tracepoint max hits reached (`--tracepoint-max`)
 6. All tracepoints hit at least once (`--tracepoint-stop`)
 
-## Cycle Timing (Rough Estimate)
+## Cycle Timing
 
-The `clk` field provides a rough cycle count based on base instruction timings from the TMS9900 Data Manual. This does NOT account for addressing mode overhead or memory wait states - actual hardware timing would be higher.
+The `clk` field follows the TMS9900 Data Manual timing equation:
+
+```
+clocks = C + W * M
+```
+
+`C` and `M` include the instruction's Table 3 base clocks and memory accesses
+plus the applicable Table A/B source and destination addressing-mode
+additions. `W` is configured with `--wait-states=N` and defaults to zero.
+Counters are 64-bit.
+
+The wait-state setting is deliberately uniform. It is suitable for a flat
+memory/compiler harness, but does not model a TI-99/4A's mix of fast 16-bit and
+wait-stated 8-bit regions.
 
 Base timings (register-to-register only):
 - Arithmetic (A, S, etc): 14 cycles
@@ -207,6 +239,35 @@ Base timings (register-to-register only):
 - Multiply: 52 cycles
 - Divide: 16 (overflow) or 92-124 cycles
 
+TI documents successful DIV as data-dependent on internal partial quotients
+but does not publish the divider microcode. The simulator uses MAME's bounded
+92-124-cycle model rather than claiming undocumented cycle-exact DIV timing.
+
+## Testing
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+CTest covers CPU control and interrupt sequencing, all opcode decode words,
+addressing modes, all branch/status combinations, exhaustive ALU/byte/shift
+semantics, timing/wait-state cases, disassembly wraparound, CLI trace/summary
+behavior, IDLE timer wakeup, memory dumps, and GDB packet validation.
+
+## GDB Compatibility Server
+
+`--gdb=PORT` exposes register inspection, memory access, stepping, continue,
+and software breakpoints through the GDB Remote Serial Protocol. Stock GDB has
+no TMS9900 architecture, so the server advertises an MSP430-shaped register
+set: PC, WP, ST, and TMS9900 R0-R12. TMS9900 R13-R15 remain accessible through
+workspace memory.
+
+This mode is useful for machine-level inspection only. MSP430 disassembly and
+the register numbering do not match TMS9900 compiler DWARF, so source-level
+debugging requires a real TMS9900 GDB architecture port.
+
 ## Limitations
 
 - CRU instructions (SBO, SBZ, TB, LDCR, STCR) are accepted but have no hardware effect
@@ -215,6 +276,8 @@ Base timings (register-to-register only):
   - `TB`: Always returns 0 (bit not set)
 - No memory-mapped I/O (VDP, GROM, sound, etc.)
 - Memory is flat 64K RAM (no ROM/write protection)
+- External-operation pins for CKON, CKOF, LREX, RSET, and IDLE are not exposed
+- LOAD and bus-visible discarded reads are not modeled
 
 ## Status Register Bits
 
