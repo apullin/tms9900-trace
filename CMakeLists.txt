@@ -40,6 +40,32 @@ set(SOURCES
 # Executable
 add_executable(tms9900-trace ${SOURCES})
 
+include(CTest)
+
+if(BUILD_TESTING)
+    add_executable(tms9900-cpu-tests
+        test/cpu_tests.cpp
+        src/cpu.cpp
+        src/disasm.cpp
+    )
+
+    add_test(NAME cpu-control COMMAND tms9900-cpu-tests)
+    add_test(NAME cpu-addressing COMMAND tms9900-cpu-tests addressing)
+    add_test(NAME cpu-branches COMMAND tms9900-cpu-tests branches)
+    add_test(NAME cpu-decode COMMAND tms9900-cpu-tests decode)
+    add_test(NAME cpu-semantics COMMAND tms9900-cpu-tests semantic-core)
+
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME cli-integration
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_SOURCE_DIR}/test/cli_tests.py
+                    $<TARGET_FILE:tms9900-trace>
+                    ${CMAKE_SOURCE_DIR}/test/simple.bin
+        )
+    endif()
+endif()
+
 # Installation
 install(TARGETS tms9900-trace
     RUNTIME DESTINATION bin
