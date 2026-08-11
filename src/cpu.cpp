@@ -10,7 +10,7 @@
 // Modifications for standalone use:
 // - Removed TI-99/4a specific dependencies (CRU, TMS9901, memory manager)
 // - Simplified to flat 64K memory model
-// - CRU instructions (SBO, SBZ, TB, LDCR, STCR) are no-ops
+// - CRU pins are not modeled; instructions retain their CPU-visible effects
 // - Interrupt handling via scheduled interrupts (--irq option)
 //
 // Cycle timing reference: TMS9900 Data Manual (May 1976), Table 3
@@ -1198,11 +1198,13 @@ static void opcode_LDCR()
 
     AddInstructionTiming(2 * count);
 
-    // Still need to read the value (affects flags)
-    ST &= ~(TMS_LOGICAL | TMS_ARITHMETIC | TMS_EQUAL | TMS_OVERFLOW | TMS_PARITY);
+    // LDCR affects LGT, AGT, and EQ. Byte transfers also affect parity;
+    // carry and overflow are preserved.
+    ST &= ~(TMS_LOGICAL | TMS_ARITHMETIC | TMS_EQUAL);
 
     if (count < 9)
     {
+        ST &= ~TMS_PARITY;
         UINT16 address = GetAddress(curOpCode, 1);
         UINT16 value = ReadMemoryB(address);
         ST |= parity[(UINT8)value];
@@ -1225,7 +1227,8 @@ static void opcode_STCR()
         count = 16;
     }
 
-    ST &= ~(TMS_LOGICAL | TMS_ARITHMETIC | TMS_EQUAL | TMS_OVERFLOW | TMS_PARITY);
+    // STCR has the same status effects as LDCR.
+    ST &= ~(TMS_LOGICAL | TMS_ARITHMETIC | TMS_EQUAL);
 
     AddInstructionTiming((count & 0x07) ? 0 : 2);
 
@@ -1234,6 +1237,7 @@ static void opcode_STCR()
 
     if (count < 9)
     {
+        ST &= ~TMS_PARITY;
         ST |= parity[(UINT8)value];
         SetFlags_LAE((INT8)value);
         UINT16 address = GetAddress(curOpCode, 1);

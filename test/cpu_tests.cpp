@@ -311,6 +311,42 @@ void TestVariableTiming() {
   }
 }
 
+void TestCRUStatusEffects() {
+  constexpr UINT16 Preserved =
+      TMS_CARRY | TMS_OVERFLOW | TMS_XOP | TMS_PARITY | 0x000A;
+
+  Begin(0x1000, 0x0200, Preserved);
+  RawWriteWord(0x1000, 0x8000);
+  RawWriteWord(0x0200, 0x3000); // LDCR R0,16.
+  StepCPU();
+  CheckHex("LDCR word preserves unrelated status",
+           Status, Preserved | TMS_LOGICAL);
+
+  Begin(0x1000, 0x0200, Preserved);
+  Memory[0x1000] = 0x03;
+  RawWriteWord(0x0200, 0x3200); // LDCR R0,8.
+  StepCPU();
+  CheckHex("LDCR byte recomputes parity", Status,
+           static_cast<UINT16>((Preserved & ~TMS_PARITY) |
+                               TMS_LOGICAL | TMS_ARITHMETIC));
+
+  Begin(0x1000, 0x0200, Preserved);
+  RawWriteWord(0x1000, 0xFFFF);
+  RawWriteWord(0x0200, 0x3400); // STCR R0,16; bare CRU reads zero.
+  StepCPU();
+  CheckHex("STCR word preserves unrelated status",
+           Status, Preserved | TMS_EQUAL);
+  CheckHex("STCR word writes CRU input", RawReadWord(0x1000), 0x0000);
+
+  Begin(0x1000, 0x0200, Preserved);
+  Memory[0x1000] = 0xFF;
+  RawWriteWord(0x0200, 0x3600); // STCR R0,8; bare CRU reads zero.
+  StepCPU();
+  CheckHex("STCR byte recomputes parity", Status,
+           static_cast<UINT16>((Preserved & ~TMS_PARITY) | TMS_EQUAL));
+  Check("STCR byte writes CRU input", Memory[0x1000], 0x00);
+}
+
 void TestResetInterruptClearsStatus() {
   Begin(0x1000, 0x0200, 0xFFFF);
   RawWriteWord(0x0000, 0x1100);
@@ -1553,6 +1589,7 @@ int main(int argc, char **argv) {
   TestWaitStateTiming();
   TestInspectionAndResetAPI();
   TestVariableTiming();
+  TestCRUStatusEffects();
   TestBLWPDefersInterrupt();
   TestXOPDefersInterrupt();
   TestContextSwitchState();
