@@ -537,12 +537,12 @@ void TestArchitecturalAddressAlignment() {
 }
 
 void TestDecodeAndDisassemblyEdges() {
-  Check("reserved >0210 does not decode as LI",
-        std::strcmp(LookupOpCode(0x0210)->mnemonic, "INVL") == 0, 1);
-  Check("reserved >0230 does not decode as AI",
-        std::strcmp(LookupOpCode(0x0230)->mnemonic, "INVL") == 0, 1);
-  Check("reserved >02B0 does not decode as STWP",
-        std::strcmp(LookupOpCode(0x02B0)->mnemonic, "INVL") == 0, 1);
+  Check("LI ignores N bit in >0210",
+        std::strcmp(LookupOpCode(0x0210)->mnemonic, "LI") == 0, 1);
+  Check("AI ignores N bit in >0230",
+        std::strcmp(LookupOpCode(0x0230)->mnemonic, "AI") == 0, 1);
+  Check("STWP ignores N bit in >02B0",
+        std::strcmp(LookupOpCode(0x02B0)->mnemonic, "STWP") == 0, 1);
 
   Begin();
   RawWriteWord(0x0200, 0x2CC1); // XOP R1,3
@@ -588,20 +588,97 @@ void TestDecodeAndDisassemblyEdges() {
                             bounded.guard[3] == 0x5A), 1);
 }
 
+
+// Data Manual 3.5.9-3.5.13 labels these opcode fields N (don't care).
+// Test every register with bit 4 set, and every nonzero low-five-bit value
+// for instructions without a register field. Compare execution and text to
+// canonical zero-N encodings, independently of the opcode-pattern sweep.
+void TestDontCareEncodings() {
+  struct Encoding {
+    UINT16 opcode;
+    bool hasRegister;
+  } encodings[] = {
+      {0x0200, true}, {0x0220, true}, {0x0240, true}, {0x0260, true},
+      {0x0280, true}, {0x02A0, true}, {0x02C0, true},
+      {0x02E0, false}, {0x0300, false}, {0x0340, false},
+      {0x0360, false}, {0x0380, false}, {0x03A0, false},
+      {0x03C0, false}, {0x03E0, false},
+  };
+  UINT8 expectedMemory[sizeof(Memory)];
+  unsigned cases = 0, mismatches = 0;
+  auto prepare = [](UINT16 opcode) {
+    Begin(0x1000, 0x0200, 0xA1AF);
+    for (unsigned reg = 0; reg != 16; ++reg)
+      RawWriteWord(static_cast<UINT16>(0x1000 + reg * 2),
+                   static_cast<UINT16>(0xA55A + reg));
+    RawWriteWord(0x101A, 0x1800); // RTWP target WP
+    RawWriteWord(0x101C, 0x3000); // RTWP target PC
+    RawWriteWord(0x101E, 0x5A03); // RTWP target ST
+    RawWriteWord(0x0200, opcode);
+    RawWriteWord(0x0202, 0x1200); // immediate / new WP
+  };
+
+  for (const Encoding &encoding : encodings) {
+    const unsigned count = encoding.hasRegister ? 16 : 31;
+    for (unsigned i = 0; i != count; ++i) {
+      const UINT16 canonical = static_cast<UINT16>(
+          encoding.opcode | (encoding.hasRegister ? i : 0));
+      const UINT16 variant = static_cast<UINT16>(
+          canonical | (encoding.hasRegister ? 0x10 : i + 1));
+      prepare(canonical);
+      char expectedText[80];
+      const UINT16 expectedNext =
+          DisassembleASM(0x0200, expectedText, sizeof(expectedText));
+      const CPUStepResult expectedStep = StepCPU();
+      const UINT16 expectedWP = WorkspacePtr, expectedPC = ProgramCounter;
+      const UINT16 expectedST = Status;
+      const UINT64 expectedCycles = ClockCycleCounter;
+      std::memcpy(expectedMemory, Memory, sizeof(Memory));
+
+      prepare(variant);
+      char actualText[80];
+      const UINT16 actualNext =
+          DisassembleASM(0x0200, actualText, sizeof(actualText));
+      const CPUStepResult actualStep = StepCPU();
+      // Ignore the deliberately different instruction bits when comparing RAM.
+      RawWriteWord(0x0200, canonical);
+      const bool equal = WorkspacePtr == expectedWP &&
+          ProgramCounter == expectedPC && Status == expectedST &&
+          ClockCycleCounter == expectedCycles && InstructionCounter == 1 &&
+          actualStep.event == expectedStep.event &&
+          actualStep.halted == expectedStep.halted &&
+          actualNext == expectedNext &&
+          std::strcmp(actualText, expectedText) == 0 &&
+          std::memcmp(Memory, expectedMemory, sizeof(Memory)) == 0;
+      if (!equal) {
+        if (mismatches < 8)
+          std::printf("N-BITS FAIL opcode=>%04X canonical=>%04X\n",
+                      variant, canonical);
+        ++mismatches;
+      }
+      ++cases;
+    }
+  }
+  std::printf("Don't-care encodings: %u cases, %u mismatches\n", cases,
+              mismatches);
+  if (mismatches != 0)
+    ++Failures;
+}
+
 void RunDecodeSweep() {
   struct Pattern {
     UINT16 opcode;
     UINT16 mask;
     const char *mnemonic;
   } patterns[] = {
-      {0x0200, 0xFFF0, "LI"},   {0x0220, 0xFFF0, "AI"},
-      {0x0240, 0xFFF0, "ANDI"}, {0x0260, 0xFFF0, "ORI"},
-      {0x0280, 0xFFF0, "CI"},   {0x02A0, 0xFFF0, "STWP"},
-      {0x02C0, 0xFFF0, "STST"}, {0x02E0, 0xFFF0, "LWPI"},
-      {0x0300, 0xFFF0, "LIMI"}, {0x0340, 0xFFFF, "IDLE"},
-      {0x0360, 0xFFFF, "RSET"}, {0x0380, 0xFFFF, "RTWP"},
-      {0x03A0, 0xFFFF, "CKON"}, {0x03C0, 0xFFFF, "CKOF"},
-      {0x03E0, 0xFFFF, "LREX"}, {0x0400, 0xFFC0, "BLWP"},
+      {0x0200, 0xFFE0, "LI"},   {0x0220, 0xFFE0, "AI"},
+      {0x0240, 0xFFE0, "ANDI"}, {0x0260, 0xFFE0, "ORI"},
+      {0x0280, 0xFFE0, "CI"},   {0x02A0, 0xFFE0, "STWP"},
+      {0x02C0, 0xFFE0, "STST"}, {0x02E0, 0xFFE0, "LWPI"},
+      {0x0300, 0xFFE0, "LIMI"}, {0x0340, 0xFFE0, "IDLE"},
+      {0x0360, 0xFFE0, "RSET"}, {0x0380, 0xFFE0, "RTWP"},
+      {0x03A0, 0xFFE0, "CKON"}, {0x03C0, 0xFFE0, "CKOF"},
+      {0x03E0, 0xFFE0, "LREX"}, {0x0400, 0xFFC0, "BLWP"},
       {0x0440, 0xFFC0, "B"},    {0x0480, 0xFFC0, "X"},
       {0x04C0, 0xFFC0, "CLR"},  {0x0500, 0xFFC0, "NEG"},
       {0x0540, 0xFFC0, "INV"},  {0x0580, 0xFFC0, "INC"},
@@ -1576,6 +1653,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "decode") == 0) {
     RunDecodeSweep();
+    TestDontCareEncodings();
     return Failures == 0 ? 0 : 1;
   }
 
@@ -1595,6 +1673,7 @@ int main(int argc, char **argv) {
   TestContextSwitchState();
   TestArchitecturalAddressAlignment();
   TestDecodeAndDisassemblyEdges();
+  TestDontCareEncodings();
 
   std::printf("\n%d probe assertion(s) failed\n", Failures);
   return Failures == 0 ? 0 : 1;
