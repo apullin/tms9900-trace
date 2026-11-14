@@ -12,6 +12,7 @@
 #define TMS9900_CPU_HPP_
 
 #include "types.hpp"
+#include <vector>
 
 //----------------------------------------------------------------------------
 // Opcode structure
@@ -84,6 +85,24 @@ void SetWorkspacePointer(UINT16 address);
 // Add this many wait-state clocks to every modeled memory access.
 void SetMemoryWaitStates(UINT32 waitStates);
 UINT32 GetMemoryWaitStates();
+
+// Optional TI-99/4A memory-mapped peripheral emulation (TMS9918A VDP, GROM, PSG).
+void SetTI99IOEnabled(bool enabled);
+bool GetTI99IOEnabled();
+void ResetTI99IO();
+extern UINT8 VDP_VRAM[0x4000];
+extern UINT8 VDP_Regs[8];
+extern UINT8 GROM_Mem[0x10000];
+extern UINT8 GROM_CartBases[16][0xA000];
+extern UINT8 SAMS_Mem[256][0x1000];
+extern UINT8 SAMS_Regs[16];
+extern bool  SAMS_RegsVisible;
+extern bool  SAMS_MapEnabled;
+extern UINT8 CART_Banks[16][0x2000];
+extern UINT8 CART_ActiveBank;
+extern bool  CART_BankingEnabled;
+extern bool  VDP_AddressLatched;
+extern std::vector<UINT8> PSG_Writes;
 
 // Advance to the next CPU event. Interrupt entry is reported separately and
 // does not increment InstructionCounter.

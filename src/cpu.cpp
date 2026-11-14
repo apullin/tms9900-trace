@@ -52,6 +52,32 @@ static UINT32  memoryWaitStates;
 static UINT64  instructionCycles;
 static UINT64  instructionMemoryAccesses;
 
+// Optional TI-99/4A MMIO state (VDP TMS9918A, GROM, SN76489 PSG)
+static bool    ti99IOEnabled = false;
+UINT8          VDP_VRAM[0x4000];
+UINT8          VDP_Regs[8];
+UINT8          GROM_Mem[0x10000];
+UINT8          GROM_CartBases[16][0xA000];
+UINT8          SAMS_Mem[256][0x1000];
+UINT8          SAMS_Regs[16];
+bool           SAMS_RegsVisible = false;
+bool           SAMS_MapEnabled = false;
+UINT8          CART_Banks[16][0x2000];
+UINT8          CART_ActiveBank = 0;
+bool           CART_BankingEnabled = false;
+bool           VDP_AddressLatched = false;
+std::vector<UINT8> PSG_Writes;
+
+static UINT8   vdpLatchByte = 0;
+static UINT16  vdpAddr = 0;
+static UINT8   vdpReadAhead = 0;
+static UINT8   vdpStatus = 0;
+static UINT16  gromAddr = 0;
+static UINT8   gromBase = 0;
+static UINT8   gromLatchMSB = 0;
+static bool    gromLatched = false;
+static bool    gromReadAddrToggle = false;
+
 //----------------------------------------------------------------------------
 // Opcode lookup tables
 //----------------------------------------------------------------------------
@@ -262,25 +288,300 @@ void WriteWord(UINT16 address, UINT16 value)
     Memory[address + 1] = value & 0xFF;
 }
 
+static UINT8 TI99ReadMMIOByte(UINT16 address)
+{
+    // VDP read ports: >8800 (VDPRD), >8802 (VDPSTA), mirrored across >8800..>8BFF
+    if (address >= 0x8800 && address < 0x8C00)
+    {
+        VDP_AddressLatched = false;
+        if ((address & 0x0002) == 0)
+        {
+            UINT8 out = vdpReadAhead;
+            vdpReadAhead = VDP_VRAM[vdpAddr & 0x3FFF];
+            vdpAddr = (vdpAddr + 1) & 0x3FFF;
+            return out;
+        }
+        UINT8 st = vdpStatus;
+        vdpStatus &= 0x1F;
+        return st;
+    }
+
+    // GROM read ports: >9800+4*b (GROMRD), >9802+4*b (GROMRA), 16 bases across >9800..>9BFF
+    if (address >= 0x9800 && address < 0x9C00)
+    {
+        UINT8 base = static_cast<UINT8>((address >> 2) & 0x0F);
+        gromLatched = false;
+        if ((address & 0x0002) == 0)
+        {
+            gromReadAddrToggle = false;
+            UINT8 out;
+            if (gromAddr < 0x6000)
+                out = GROM_Mem[gromAddr];
+            else if (base == 0)
+                out = GROM_Mem[gromAddr];
+            else
+                out = GROM_CartBases[base][gromAddr - 0x6000];
+            gromAddr = static_cast<UINT16>((gromAddr & 0xE000) | ((gromAddr + 1) & 0x1FFF));
+            return out;
+        }
+        // GROMRA returns (current_addr + 1), MSB first then LSB
+        UINT16 reported = static_cast<UINT16>((gromAddr & 0xE000) | ((gromAddr + 1) & 0x1FFF));
+        UINT8 out = gromReadAddrToggle ? static_cast<UINT8>(reported & 0xFF)
+                                       : static_cast<UINT8>(reported >> 8);
+        gromReadAddrToggle = !gromReadAddrToggle;
+        return out;
+    }
+
+    // Write-only device space (>8400..>87FF, >8C00..>8FFF, >9C00..>9FFF):
+    // TMS9900's read-before-write bus cycle hits these without side effects.
+    return Memory[address];
+}
+
+static void TI99WriteMMIOByte(UINT16 address, UINT8 value)
+{
+    // Sound chip (SN76489 / TMS9919) at >8400..>87FF
+    if (address >= 0x8400 && address < 0x8800)
+    {
+        PSG_Writes.push_back(value);
+        Memory[address] = value;
+        return;
+    }
+
+    // VDP write ports: >8C00 (VDPWD), >8C02 (VDPWA), mirrored across >8C00..>8FFF
+    if (address >= 0x8C00 && address < 0x9000)
+    {
+        if ((address & 0x0002) == 0)
+        {
+            VDP_AddressLatched = false;
+            VDP_VRAM[vdpAddr & 0x3FFF] = value;
+            vdpReadAhead = value;
+            vdpAddr = (vdpAddr + 1) & 0x3FFF;
+        }
+        else
+        {
+            if (!VDP_AddressLatched)
+            {
+                vdpLatchByte = value;
+                VDP_AddressLatched = true;
+            }
+            else
+            {
+                VDP_AddressLatched = false;
+                if (value & 0x80)
+                {
+                    VDP_Regs[value & 0x07] = vdpLatchByte;
+                }
+                else
+                {
+                    vdpAddr = static_cast<UINT16>(vdpLatchByte | ((value & 0x3F) << 8));
+                    if ((value & 0x40) == 0)
+                    {
+                        vdpReadAhead = VDP_VRAM[vdpAddr & 0x3FFF];
+                        vdpAddr = (vdpAddr + 1) & 0x3FFF;
+                    }
+                }
+            }
+        }
+        Memory[address] = value;
+        return;
+    }
+
+    // GROM/GRAM write ports: >9C00+4*b (GRAMWD), >9C02+4*b (GROMWA, MSB first, LSB second!)
+    if (address >= 0x9C00 && address < 0xA000)
+    {
+        UINT8 base = static_cast<UINT8>((address >> 2) & 0x0F);
+        gromBase = base;
+        if ((address & 0x0002) != 0)
+        {
+            gromReadAddrToggle = false;
+            if (!gromLatched)
+            {
+                gromLatchMSB = value;
+                gromLatched = true;
+            }
+            else
+            {
+                gromAddr = static_cast<UINT16>((gromLatchMSB << 8) | value);
+                gromLatched = false;
+            }
+        }
+        else
+        {
+            gromLatched = false;
+            if (gromAddr < 0x6000 || base == 0)
+                GROM_Mem[gromAddr] = value;
+            else
+                GROM_CartBases[base][gromAddr - 0x6000] = value;
+            gromAddr = static_cast<UINT16>((gromAddr & 0xE000) | ((gromAddr + 1) & 0x1FFF));
+        }
+        Memory[address] = value;
+        return;
+    }
+
+    WriteByte(address, value);
+}
+
+static inline bool IsSAMSMappableWindow(UINT8 win)
+{
+    return (win == 2 || win == 3 || win >= 10);
+}
+
 // Internal data accesses are untimed here. Instruction timing is accounted
 // from the manual's C/M metadata and addressing-mode additions.
 static UINT16 ReadMemoryW(UINT16 address)
 {
+    if (ti99IOEnabled)
+    {
+        if (SAMS_RegsVisible && address >= 0x4000 && address < 0x4020)
+        {
+            UINT8 reg = static_cast<UINT8>((address >> 1) & 0x0F);
+            return static_cast<UINT16>(SAMS_Regs[reg]) << 8;
+        }
+        if (CART_BankingEnabled && address >= 0x6000 && address < 0x8000)
+        {
+            UINT16 off = (address & 0xFFFE) - 0x6000;
+            return static_cast<UINT16>((CART_Banks[CART_ActiveBank][off] << 8) |
+                                       CART_Banks[CART_ActiveBank][off + 1]);
+        }
+        if (address >= 0x8400 && address < 0xA000)
+        {
+            address &= 0xFFFE;
+            // TI-99 16-to-8-bit multiplexer accesses the odd byte first, then even.
+            UINT8 lo = TI99ReadMMIOByte(static_cast<UINT16>(address | 1));
+            UINT8 hi = TI99ReadMMIOByte(address);
+            return static_cast<UINT16>((hi << 8) | lo);
+        }
+        if (SAMS_MapEnabled)
+        {
+            UINT16 a = address & 0xFFFE;
+            UINT8 win = static_cast<UINT8>(a >> 12);
+            if (IsSAMSMappableWindow(win))
+            {
+                UINT8 page = SAMS_Regs[win];
+                UINT16 off = a & 0x0FFF;
+                return static_cast<UINT16>((SAMS_Mem[page][off] << 8) | SAMS_Mem[page][off + 1]);
+            }
+        }
+    }
     return ReadWord(address);
 }
 
 static UINT8 ReadMemoryB(UINT16 address)
 {
+    if (ti99IOEnabled)
+    {
+        if (SAMS_RegsVisible && address >= 0x4000 && address < 0x4020)
+        {
+            UINT8 reg = static_cast<UINT8>((address >> 1) & 0x0F);
+            return ((address & 1) == 0) ? SAMS_Regs[reg] : 0;
+        }
+        if (CART_BankingEnabled && address >= 0x6000 && address < 0x8000)
+        {
+            return CART_Banks[CART_ActiveBank][address - 0x6000];
+        }
+        if (address >= 0x8400 && address < 0xA000)
+        {
+            return TI99ReadMMIOByte(address);
+        }
+        if (SAMS_MapEnabled)
+        {
+            UINT8 win = static_cast<UINT8>(address >> 12);
+            if (IsSAMSMappableWindow(win))
+            {
+                return SAMS_Mem[SAMS_Regs[win]][address & 0x0FFF];
+            }
+        }
+    }
     return ReadByte(address);
 }
 
 static void WriteMemoryW(UINT16 address, UINT16 value)
 {
+    if (ti99IOEnabled)
+    {
+        if (SAMS_RegsVisible && address >= 0x4000 && address < 0x4020)
+        {
+            UINT8 reg = static_cast<UINT8>((address >> 1) & 0x0F);
+            // 8-bit PEB multiplexer writes odd byte first, then even high byte last
+            // (matches icy99 pager612 dbus_in = db_out[15:8]).
+            SAMS_Regs[reg] = static_cast<UINT8>(value >> 8);
+            return;
+        }
+        if (CART_BankingEnabled && address >= 0x6000 && address < 0x8000)
+        {
+            CART_ActiveBank = static_cast<UINT8>((address >> 1) & 0x0F);
+            return;
+        }
+        if (address >= 0x8400 && address < 0xA000)
+        {
+            address &= 0xFFFE;
+            // TI-99 16-to-8-bit multiplexer writes low byte to odd address first,
+            // then high byte to even address!
+            TI99WriteMMIOByte(static_cast<UINT16>(address | 1), static_cast<UINT8>(value & 0xFF));
+            TI99WriteMMIOByte(address, static_cast<UINT8>(value >> 8));
+            return;
+        }
+        UINT16 a = address & 0xFFFE;
+        UINT8 win = static_cast<UINT8>(a >> 12);
+        if (SAMS_MapEnabled && IsSAMSMappableWindow(win))
+        {
+            UINT8 page = SAMS_Regs[win];
+            UINT16 off = a & 0x0FFF;
+            SAMS_Mem[page][off] = static_cast<UINT8>(value >> 8);
+            SAMS_Mem[page][off + 1] = static_cast<UINT8>(value & 0xFF);
+            if (page < 16)
+            {
+                WriteWord(static_cast<UINT16>((page << 12) | off), value);
+            }
+            return;
+        }
+        if (IsSAMSMappableWindow(win))
+        {
+            UINT16 off = a & 0x0FFF;
+            SAMS_Mem[win][off] = static_cast<UINT8>(value >> 8);
+            SAMS_Mem[win][off + 1] = static_cast<UINT8>(value & 0xFF);
+        }
+    }
     WriteWord(address, value);
 }
 
 static void WriteMemoryB(UINT16 address, UINT8 value)
 {
+    if (ti99IOEnabled)
+    {
+        if (SAMS_RegsVisible && address >= 0x4000 && address < 0x4020)
+        {
+            UINT8 reg = static_cast<UINT8>((address >> 1) & 0x0F);
+            SAMS_Regs[reg] = value;
+            return;
+        }
+        if (CART_BankingEnabled && address >= 0x6000 && address < 0x8000)
+        {
+            CART_ActiveBank = static_cast<UINT8>((address >> 1) & 0x0F);
+            return;
+        }
+        if (address >= 0x8400 && address < 0xA000)
+        {
+            TI99WriteMMIOByte(address, value);
+            return;
+        }
+        UINT8 win = static_cast<UINT8>(address >> 12);
+        if (SAMS_MapEnabled && IsSAMSMappableWindow(win))
+        {
+            UINT8 page = SAMS_Regs[win];
+            UINT16 off = address & 0x0FFF;
+            SAMS_Mem[page][off] = value;
+            if (page < 16)
+            {
+                WriteByte(static_cast<UINT16>((page << 12) | off), value);
+            }
+            return;
+        }
+        if (IsSAMSMappableWindow(win))
+        {
+            SAMS_Mem[win][address & 0x0FFF] = value;
+        }
+    }
     WriteByte(address, value);
 }
 
@@ -1122,19 +1423,45 @@ static void opcode_JOP()
     }
 }
 
-// CRU instructions - no-op in bare-metal mode
+// CRU instructions - SAMS >1E00 modeled when --ti99-io is active
+static inline UINT16 GetCRUBitAddress()
+{
+    INT8 disp = static_cast<INT8>(curOpCode & 0xFF);
+    UINT16 r12 = ReadWord(WP + 2 * 12);
+    return static_cast<UINT16>((r12 + 2 * disp) & 0x1FFE);
+}
+
 static void opcode_SBO()
 {
-    // No CRU hardware
+    if (ti99IOEnabled)
+    {
+        UINT16 cru = GetCRUBitAddress();
+        if (cru == 0x1E00) SAMS_RegsVisible = true;
+        else if (cru == 0x1E02) SAMS_MapEnabled = true;
+    }
 }
 
 static void opcode_SBZ()
 {
-    // No CRU hardware
+    if (ti99IOEnabled)
+    {
+        UINT16 cru = GetCRUBitAddress();
+        if (cru == 0x1E00) SAMS_RegsVisible = false;
+        else if (cru == 0x1E02) SAMS_MapEnabled = false;
+    }
 }
 
 static void opcode_TB()
 {
+    if (ti99IOEnabled)
+    {
+        UINT16 cru = GetCRUBitAddress();
+        bool bit = (cru == 0x1E00 && SAMS_RegsVisible) ||
+                   (cru == 0x1E02 && SAMS_MapEnabled);
+        if (bit) ST |= TMS_EQUAL;
+        else ST &= ~TMS_EQUAL;
+        return;
+    }
     ST &= ~TMS_EQUAL;  // Always returns 0 (bit not set)
 }
 
@@ -1533,6 +1860,43 @@ void SetMemoryWaitStates(UINT32 waitStates)
 UINT32 GetMemoryWaitStates()
 {
     return memoryWaitStates;
+}
+
+void ResetTI99IO()
+{
+    memset(VDP_VRAM, 0, sizeof(VDP_VRAM));
+    memset(VDP_Regs, 0, sizeof(VDP_Regs));
+    memset(GROM_Mem, 0, sizeof(GROM_Mem));
+    memset(GROM_CartBases, 0, sizeof(GROM_CartBases));
+    memset(SAMS_Mem, 0, sizeof(SAMS_Mem));
+    for (int i = 0; i < 16; i++)
+        SAMS_Regs[i] = static_cast<UINT8>(i);
+    SAMS_RegsVisible = false;
+    SAMS_MapEnabled = false;
+    memset(CART_Banks, 0, sizeof(CART_Banks));
+    CART_ActiveBank = 0;
+    CART_BankingEnabled = false;
+    PSG_Writes.clear();
+    VDP_AddressLatched = false;
+    vdpLatchByte = 0;
+    vdpAddr = 0;
+    vdpReadAhead = 0;
+    vdpStatus = 0x80;
+    gromAddr = 0;
+    gromBase = 0;
+    gromLatchMSB = 0;
+    gromLatched = false;
+    gromReadAddrToggle = false;
+}
+
+void SetTI99IOEnabled(bool enabled)
+{
+    ti99IOEnabled = enabled;
+}
+
+bool GetTI99IOEnabled()
+{
+    return ti99IOEnabled;
 }
 
 sOpCode* GetLastOpcode()

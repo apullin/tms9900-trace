@@ -46,6 +46,13 @@ struct Tracepoint
     UINT64 hits = 0;
 };
 
+struct BinaryLoadSpec
+{
+    UINT8 base = 0;
+    UINT16 addr = 0;
+    std::string path;
+};
+
 struct Config
 {
     const char* inputFile = nullptr;
@@ -58,9 +65,16 @@ struct Config
     std::vector<ScheduledIRQ> irqs;
     std::vector<PeriodicTimer> timers;
     std::vector<MemoryDump> dumps;
+    std::vector<MemoryDump> vramDumps;
+    std::vector<BinaryLoadSpec> gromLoads;
+    std::vector<BinaryLoadSpec> vramLoads;
+    std::vector<BinaryLoadSpec> samsLoads;
+    std::vector<BinaryLoadSpec> cartBankLoads;
+    std::vector<BinaryLoadSpec> memLoads;
     std::vector<Tracepoint> tracepoints;
     UINT64 tracepointMax = 0;
     UINT32 waitStates = 0;
+    bool ti99IO = false;
     bool tracepointStop = false;
     bool loopDetect = true;
     int gdbPort = 0;
@@ -427,7 +441,14 @@ int main(int argc, char* argv[])
     enum
     {
         OPT_WAIT_STATES = 256,
-        OPT_NO_LOOP_DETECT
+        OPT_NO_LOOP_DETECT,
+        OPT_TI99_IO,
+        OPT_LOAD_GROM,
+        OPT_LOAD_VRAM,
+        OPT_LOAD_SAMS,
+        OPT_LOAD_CART_BANK,
+        OPT_LOAD_MEM,
+        OPT_DUMP_VRAM
     };
 
     static struct option longOpts[] = {
@@ -440,6 +461,13 @@ int main(int argc, char* argv[])
         {"timer",          required_argument, nullptr, 'R'},
         {"wait-states",    required_argument, nullptr, OPT_WAIT_STATES},
         {"no-loop-detect", no_argument,       nullptr, OPT_NO_LOOP_DETECT},
+        {"ti99-io",        no_argument,       nullptr, OPT_TI99_IO},
+        {"load-grom",      required_argument, nullptr, OPT_LOAD_GROM},
+        {"load-vram",      required_argument, nullptr, OPT_LOAD_VRAM},
+        {"load-sams",      required_argument, nullptr, OPT_LOAD_SAMS},
+        {"load-cart-bank", required_argument, nullptr, OPT_LOAD_CART_BANK},
+        {"load-mem",       required_argument, nullptr, OPT_LOAD_MEM},
+        {"dump-vram",      required_argument, nullptr, OPT_DUMP_VRAM},
         {"output",         required_argument, nullptr, 'o'},
         {"dump",           required_argument, nullptr, 'd'},
         {"tracepoint",     required_argument, nullptr, 't'},
@@ -538,6 +566,121 @@ int main(int argc, char* argv[])
             case OPT_NO_LOOP_DETECT:
                 cfg.loopDetect = false;
                 break;
+            case OPT_TI99_IO:
+                cfg.ti99IO = true;
+                break;
+            case OPT_LOAD_GROM:
+            {
+                const char* c1 = strchr(optarg, ':');
+                if (!c1)
+                {
+                    fprintf(stderr, "Error: Expected [BASE:]ADDR:FILE in '%s'\n", optarg);
+                    return 1;
+                }
+                const char* c2 = strchr(c1 + 1, ':');
+                UINT8 base = 0;
+                UINT16 addr = 0;
+                std::string filePath;
+                if (c2)
+                {
+                    int b = atoi(std::string(optarg, c1 - optarg).c_str());
+                    if (b < 0 || b > 15 || !ParseHex(std::string(c1 + 1, c2 - (c1 + 1)).c_str(), &addr))
+                    {
+                        fprintf(stderr, "Error: Invalid BASE:ADDR:FILE in '%s'\n", optarg);
+                        return 1;
+                    }
+                    base = static_cast<UINT8>(b);
+                    filePath = c2 + 1;
+                }
+                else
+                {
+                    if (!ParseHex(std::string(optarg, c1 - optarg).c_str(), &addr))
+                    {
+                        fprintf(stderr, "Error: Invalid ADDR:FILE in '%s'\n", optarg);
+                        return 1;
+                    }
+                    filePath = c1 + 1;
+                }
+                cfg.ti99IO = true;
+                cfg.gromLoads.push_back({ base, addr, filePath });
+                break;
+            }
+            case OPT_LOAD_VRAM:
+            case OPT_LOAD_MEM:
+            {
+                const char* colon = strchr(optarg, ':');
+                if (!colon)
+                {
+                    fprintf(stderr, "Error: Expected ADDR:FILE in '%s'\n", optarg);
+                    return 1;
+                }
+                std::string addrStr(optarg, colon - optarg);
+                UINT16 addr = 0;
+                if (!ParseHex(addrStr.c_str(), &addr))
+                {
+                    fprintf(stderr, "Error: Invalid address in '%s'\n", optarg);
+                    return 1;
+                }
+                if (opt == OPT_LOAD_VRAM)
+                {
+                    cfg.ti99IO = true;
+                    cfg.vramLoads.push_back({ 0, addr, colon + 1 });
+                }
+                else
+                {
+                    cfg.memLoads.push_back({ 0, addr, colon + 1 });
+                }
+                break;
+            }
+            case OPT_LOAD_SAMS:
+            {
+                const char* colon = strchr(optarg, ':');
+                if (!colon)
+                {
+                    fprintf(stderr, "Error: Expected PAGE:FILE in '%s'\n", optarg);
+                    return 1;
+                }
+                UINT16 page = 0;
+                if (!ParseHex(std::string(optarg, colon - optarg).c_str(), &page) || page > 0xFF)
+                {
+                    fprintf(stderr, "Error: Invalid SAMS page (0x00..0xFF) in '%s'\n", optarg);
+                    return 1;
+                }
+                cfg.ti99IO = true;
+                cfg.samsLoads.push_back({ static_cast<UINT8>(page), 0, colon + 1 });
+                break;
+            }
+            case OPT_LOAD_CART_BANK:
+            {
+                const char* colon = strchr(optarg, ':');
+                if (!colon)
+                {
+                    fprintf(stderr, "Error: Expected BANK:FILE in '%s'\n", optarg);
+                    return 1;
+                }
+                int b = atoi(std::string(optarg, colon - optarg).c_str());
+                if (b < 0 || b > 15)
+                {
+                    fprintf(stderr, "Error: Invalid cart bank 0..15 in '%s'\n", optarg);
+                    return 1;
+                }
+                cfg.ti99IO = true;
+                cfg.cartBankLoads.push_back({ static_cast<UINT8>(b), 0, colon + 1 });
+                break;
+            }
+            case OPT_DUMP_VRAM:
+            {
+                MemoryDump dump;
+                if (!ParseDump(optarg, &dump) ||
+                    static_cast<UINT32>(dump.start) + dump.length > 0x4000)
+                {
+                    fprintf(stderr, "Error: Invalid VRAM dump spec '%s' (max 0x4000)\n", optarg);
+                    return 1;
+                }
+                cfg.ti99IO = true;
+                cfg.vramDumps.push_back(dump);
+                break;
+            }
             case 'o':
                 cfg.outputFile = optarg;
                 break;
@@ -642,12 +785,95 @@ int main(int argc, char* argv[])
 
     // Initialize CPU
     InitCPU();
+    ResetTI99IO();
+    SetTI99IOEnabled(cfg.ti99IO);
 
-    // Load binary
+    for (const auto& gl : cfg.gromLoads)
+    {
+        FILE* gf = fopen(gl.path.c_str(), "rb");
+        if (!gf)
+        {
+            fprintf(stderr, "Error: Cannot open GROM file '%s'\n", gl.path.c_str());
+            if (cfg.outputFile) fclose(out);
+            return 1;
+        }
+        if (gl.base == 0 || gl.addr < 0x6000)
+        {
+            size_t maxBytes = 0x10000 - gl.addr;
+            size_t unused = fread(&GROM_Mem[gl.addr], 1, maxBytes, gf);
+            (void)unused;
+        }
+        else
+        {
+            size_t maxBytes = 0x10000 - gl.addr;
+            size_t unused = fread(&GROM_CartBases[gl.base][gl.addr - 0x6000], 1, maxBytes, gf);
+            (void)unused;
+        }
+        fclose(gf);
+    }
+
+    for (const auto& vl : cfg.vramLoads)
+    {
+        FILE* vf = fopen(vl.path.c_str(), "rb");
+        if (!vf || vl.addr >= 0x4000)
+        {
+            if (vf) fclose(vf);
+            fprintf(stderr, "Error: Cannot load VRAM file '%s' at 0x%04X\n", vl.path.c_str(), vl.addr);
+            if (cfg.outputFile) fclose(out);
+            return 1;
+        }
+        size_t maxBytes = 0x4000 - vl.addr;
+        size_t unused = fread(&VDP_VRAM[vl.addr], 1, maxBytes, vf);
+        (void)unused;
+        fclose(vf);
+    }
+
+    // Load binary and optional extra memory images
     if (!LoadBinary(cfg.inputFile, cfg.loadAddr))
     {
         if (cfg.outputFile) fclose(out);
         return 1;
+    }
+    for (const auto& ml : cfg.memLoads)
+    {
+        if (!LoadBinary(ml.path.c_str(), ml.addr))
+        {
+            if (cfg.outputFile) fclose(out);
+            return 1;
+        }
+    }
+
+    // Sync initial 64K CPU RAM windows into default SAMS pages 0..15, then apply --load-sams
+    for (int p = 0; p < 16; p++)
+    {
+        memcpy(SAMS_Mem[p], &Memory[p << 12], 0x1000);
+    }
+    for (const auto& sl : cfg.samsLoads)
+    {
+        FILE* sf = fopen(sl.path.c_str(), "rb");
+        if (!sf)
+        {
+            fprintf(stderr, "Error: Cannot open SAMS page file '%s'\n", sl.path.c_str());
+            if (cfg.outputFile) fclose(out);
+            return 1;
+        }
+        size_t unused = fread(SAMS_Mem[sl.base], 1, 0x1000, sf);
+        (void)unused;
+        fclose(sf);
+    }
+    for (const auto& cb : cfg.cartBankLoads)
+    {
+        FILE* cf = fopen(cb.path.c_str(), "rb");
+        if (!cf)
+        {
+            fprintf(stderr, "Error: Cannot open cart bank file '%s'\n", cb.path.c_str());
+            if (cfg.outputFile) fclose(out);
+            return 1;
+        }
+        size_t unused = fread(CART_Banks[cb.base], 1, 0x2000, cf);
+        (void)unused;
+        fclose(cf);
+        CART_BankingEnabled = true;
     }
 
     // Set up initial state
@@ -942,7 +1168,63 @@ int main(int argc, char* argv[])
             if (i > 0) fprintf(out, ",");
             fprintf(out, "\"%04X\"", reg);
         }
-        fprintf(out, "]}\n");
+        fprintf(out, "]");
+        if (!cfg.tracepoints.empty())
+        {
+            fprintf(out, ",\"tp\":{");
+            for (size_t i = 0; i < cfg.tracepoints.size(); i++)
+            {
+                if (i > 0) fprintf(out, ",");
+                fprintf(out, "\"%04X\":%" PRIu64,
+                        cfg.tracepoints[i].pc, cfg.tracepoints[i].hits);
+            }
+            fprintf(out, "}");
+        }
+        if (cfg.ti99IO)
+        {
+            fprintf(out, ",\"vdp_latched\":%s,\"vdp_regs\":[",
+                    VDP_AddressLatched ? "true" : "false");
+            for (int i = 0; i < 8; i++)
+            {
+                if (i > 0) fprintf(out, ",");
+                fprintf(out, "\"%02X\"", VDP_Regs[i]);
+            }
+            fprintf(out, "],\"psg\":[");
+            for (size_t i = 0; i < PSG_Writes.size(); i++)
+            {
+                if (i > 0) fprintf(out, ",");
+                fprintf(out, "\"%02X\"", PSG_Writes[i]);
+            }
+            fprintf(out, "],\"sams_vis\":%s,\"sams_map\":%s,\"cart_bank\":%u,\"sams_regs\":[",
+                    SAMS_RegsVisible ? "true" : "false",
+                    SAMS_MapEnabled ? "true" : "false",
+                    static_cast<unsigned>(CART_ActiveBank));
+            for (int i = 0; i < 16; i++)
+            {
+                if (i > 0) fprintf(out, ",");
+                fprintf(out, "\"%02X\"", SAMS_Regs[i]);
+            }
+            fprintf(out, "]");
+        }
+        fprintf(out, "}\n");
+    }
+
+    // VRAM dumps
+    for (const auto& dump : cfg.vramDumps)
+    {
+        const UINT32 end = static_cast<UINT32>(dump.start) + dump.length - 1;
+        fprintf(stderr, "\nVRAM dump 0x%04X - 0x%04X (%" PRIu32 " bytes):\n",
+                dump.start, end, dump.length);
+        for (UINT32 offset = 0; offset < dump.length; offset += 16)
+        {
+            const UINT32 lineAddress = static_cast<UINT32>(dump.start) + offset;
+            fprintf(stderr, "  V%04X:", lineAddress);
+            for (UINT32 i = 0; i < 16 && offset + i < dump.length; i++)
+            {
+                fprintf(stderr, " %02X", VDP_VRAM[lineAddress + i]);
+            }
+            fprintf(stderr, "\n");
+        }
     }
 
     // Memory dumps
